@@ -85,7 +85,14 @@ class RunKeys:
                 reasoning=reasoning, expires_at=expires_at, cap=cap, used=0)
         return key
 
+    def run_for_key(self, key):
+        with self.lock:
+            record = self.keys.get(hashlib.sha256(key.encode()).hexdigest())
+            return record["run_id"] if record else None
+
     def admit(self, key, request):
+        if not isinstance(request, dict) or not isinstance(request.get("reasoning", {}), dict):
+            raise Refusal("invalid_request")
         with self.lock:
             k = self.keys.get(hashlib.sha256(key.encode()).hexdigest())
             if not k or k["expires_at"] <= time.time() or k["used"] >= k["cap"]:
@@ -94,6 +101,12 @@ class RunKeys:
                 raise Refusal("model_or_reasoning_mismatch")
             k["used"] += 1
             return dict(k)
+
+    def worker_key_active(self, key):
+        with self.lock:
+            k = self.keys.get(hashlib.sha256(key.encode()).hexdigest())
+            return bool(k and k['role'] != 'acceptance' and k['expires_at'] > time.time()
+                        and k['used'] < k['cap'])
 
     def revoke_run(self, run_id):
         with self.lock:
@@ -111,5 +124,5 @@ def reconstruct_sse(body):
     completed = [e for e in events if e.get("type") == "response.completed"]
     failures = [e for e in events if e.get("type") in {"response.failed", "response.incomplete", "error"}]
     return {"events": events, "response": completed[-1].get("response") if completed else None,
-            "complete": len(completed) == 1 and not failures,
+            "complete": len(completed) == 1 and not failures and events[-1] is completed[0],
             "terminal": failures[-1].get("type") if failures else ("response.completed" if completed else "interrupted")}
