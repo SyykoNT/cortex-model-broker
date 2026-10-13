@@ -14,18 +14,76 @@ from .auth import Auth, AuthError, Store
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
+    def server_close(self):
+        worker = getattr(self, "worker", None)
+        if worker is not None:
+            worker.close()
+        admin = getattr(self, "admin", None)
+        if admin is not None:
+            admin.close()
+        super().server_close()
+
     def handle_error(self, request, client_address):
         # Callback request lines contain authorization codes. Never print tracebacks.
         print("setup_request_failed", flush=True)
 
 
-def make_server(directory, port):
+def make_server(directory, port, *, admin_path=None, admin_uid=None, admin_gid=None,
+                transport_factory=None, codex_binary=None, capture_directory=None,
+                scanner=None, worker_port=None, worker_host='127.0.0.1'):
+    from pathlib import Path
+    import ipaddress
+    admin_options = (admin_path, admin_uid, admin_gid)
+    if any(v is not None for v in admin_options) and not all(v is not None for v in admin_options):
+        raise ValueError('incomplete_admin_configuration')
+    if (capture_directory is None) != (scanner is None):
+        raise ValueError('incomplete_capture_configuration')
+    if capture_directory is not None:
+        if admin_path is None or transport_factory is not None:
+            raise ValueError('invalid_capture_composition')
+        state, capture = Path(directory).absolute(), Path(capture_directory).absolute()
+        if state == capture or state in capture.parents or capture in state.parents:
+            raise ValueError('state_capture_must_be_separate')
+    if worker_port is not None:
+        if capture_directory is None:
+            raise ValueError('worker_listener_requires_capture')
+        # Numeric IPv4 only. The operator must bind an explicit proxy-reachable
+        # interface, never an accidental wildcard. No network discovery or DNS.
+        address = ipaddress.IPv4Address(worker_host)
+        if address.is_unspecified or address.is_multicast or not 0 <= worker_port <= 65535:
+            raise ValueError('invalid_worker_listener')
+    elif worker_host != '127.0.0.1':
+        raise ValueError('worker_host_requires_port')
     server = Server(("127.0.0.1", port), Handler)
-    actual = server.server_address[1]
-    server.origin = f"http://127.0.0.1:{actual}"
-    server.auth = Auth(Store(directory), server.origin + "/auth/callback")
-    server.csrf = secrets.token_urlsafe(32)
-    server.mutation_lock = threading.Lock()
+    try:
+        actual = server.server_address[1]
+        server.origin = f"http://127.0.0.1:{actual}"
+        server.auth = Auth(Store(directory), server.origin + "/auth/callback")
+        server.csrf = secrets.token_urlsafe(32)
+        server.mutation_lock = threading.Lock()
+        if admin_path is not None:
+            from .admin import AdminServer, Controller
+            from .protocol import RunKeys
+            from .codex_limits import CodexLimits
+            keys = RunKeys()
+            transport = transport_factory(server.auth, keys) if transport_factory else None
+            if capture_directory is not None:
+                from .capture_health import BrokerCapture
+                from .traffic import Transport
+                capture = BrokerCapture(capture_directory, scanner)
+                transport = Transport(server.auth, keys, capture, capture.on_limit)
+            codex = CodexLimits(codex_binary, server.auth.store.root) if codex_binary else None
+            controller = Controller(server.auth, keys, transport=transport, codex=codex)
+            server.admin = AdminServer(admin_path, admin_uid, admin_gid, controller).start()
+            if worker_port is not None:
+                from .worker import Readiness, WorkerServer
+                readiness = Readiness(transport.capture)
+                # Admin acceptance Transport is deliberately NOT worker Transport.
+                # Its broker-only capture cannot satisfy the all-three gate.
+                server.worker = WorkerServer((worker_host, worker_port), readiness).start()
+    except Exception:
+        server.server_close()
+        raise
     return server
 
 
@@ -117,13 +175,39 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", required=True)
     parser.add_argument("--port", type=int, default=18741)
+    parser.add_argument("--admin-socket")
+    parser.add_argument("--admin-uid", type=int, help="Only this kernel peer UID may administer")
+    parser.add_argument("--admin-gid", type=int, help="Restrictive socket group")
+    parser.add_argument("--codex-binary", help="Optional trusted absolute Codex executable")
+    parser.add_argument("--capture-directory", help="Prepared absolute broker-owned capture directory")
+    parser.add_argument("--gitleaks", help="Trusted absolute gitleaks executable (required with capture)")
+    parser.add_argument("--worker-port", type=int, help="Separate worker listener; admission remains disabled")
+    parser.add_argument("--worker-host", default='127.0.0.1', help="Explicit numeric IPv4 bind address, never wildcard")
     args = parser.parse_args()
+    admin_options = (args.admin_socket, args.admin_uid, args.admin_gid)
+    if any(v is not None for v in admin_options) and not all(v is not None for v in admin_options):
+        parser.error("admin socket, UID and GID must be configured together")
     for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "XAI_API_KEY"):
         if os.environ.get(name):
             raise SystemExit("API-key environment refused")
-    server = make_server(args.state, args.port)
-    print(f"SIWC setup ready at {server.origin}; worker inference disabled", flush=True)
-    server.serve_forever()
+    try:
+        server = make_server(args.state, args.port, admin_path=args.admin_socket,
+                             admin_uid=args.admin_uid, admin_gid=args.admin_gid, codex_binary=args.codex_binary,
+                             capture_directory=args.capture_directory, scanner=args.gitleaks,
+                             worker_port=args.worker_port, worker_host=args.worker_host)
+    except Exception:
+        raise SystemExit("setup_start_failed") from None
+    import signal
+    def terminate(signum, frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, terminate)
+    worker = getattr(server, 'worker', None)
+    listener = f'; worker listener at http://{worker.authority}' if worker else ''
+    print(f"SIWC setup ready at {server.origin}; worker inference disabled{listener}", flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

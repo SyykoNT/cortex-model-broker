@@ -15,6 +15,9 @@ not a claim of a production-accepted worker platform.
   refresh-token revocation retains account/client mappings for reauthorization.
 * Responses preview adapter; model/reasoning-bound expiring request-cap keys;
   SSE reconstruction; capture-first provider transport and gitleaks redaction.
+* Deployable peer-checked admin socket with actual broker-owned capture and live
+  disk/scanner health probes; a separate worker HTTP listener that stays closed
+  to inference while the all-three logging and acceptance integrations are missing.
 
 ## Setup
 
@@ -23,9 +26,13 @@ Python 3.11+ and uv are required. Tested with Python 3.14.
 ```sh
 uv venv
 uv pip install --python .venv/bin/python -r requirements.txt
-.venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python -m cortex_broker.setup --state ./state --port 18741
 ```
+
+For the full suite, install test-only `playwright==1.63.0` and its Chromium,
+install checksum-verified gitleaks (see CI), and set `TEST_GITLEAKS` and
+`TEST_CHROMIUM` to their absolute executable paths. Then run
+`.venv/bin/python -m unittest discover -s tests -v`; skipped tests are not a pass.
 
 Open `http://127.0.0.1:18741/` in the browser **on the same host**. Press
 **Continue with ChatGPT**. Authorize the requested ChatGPT plan permission.
@@ -43,11 +50,15 @@ No API-key, alternative-provider or alternative-model fallback exists.
 
 ## Integration status and limitations
 
-`traffic.Transport` is an exercised library, not an exposed production service.
-The deployment must still connect its real proxy/orchestrator health checks,
-Unix admin socket, HTTP endpoint, audit-flag notifications and trace export.
-The setup service does not claim these integrations are live. It also does not
-start any agent, container, scheduler, Claude lane or Grok lane.
+The Linux Unix admin socket now composes the real `traffic.Transport` from CLI
+flags, without an injectable-only factory; see [installation and protocol](docs/admin-socket.md).
+Fixed admin acceptance uses healthy broker capture and cannot unlock workers.
+The separate worker HTTP adapter is implemented and exercised offline, but its
+shipped CLI returns 503: real proxy/orchestrator health and live FC2/FC5 evidence
+are not integrated. Audit-flag notifications, archive handoff and trace export
+remain deployment work. No fake heartbeat or ready marker substitutes for those
+requirements. The service does not start any agent, container, scheduler, Claude
+lane or Grok lane. No token-metering dashboard is included.
 
 Transport buffering preserves the original upstream SSE bytes but delays
 consumer delivery until capture completes. A gitleaks hit redacts that whole

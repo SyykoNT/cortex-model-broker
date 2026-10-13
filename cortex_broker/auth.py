@@ -35,6 +35,20 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
 
+def bounded_body(response, limit, seconds):
+    deadline = time.monotonic() + seconds
+    body = bytearray()
+    while True:
+        if time.monotonic() >= deadline:
+            raise AuthError("provider_deadline")
+        chunk = response.read1(min(65536, limit + 1 - len(body)))
+        if not chunk:
+            return bytes(body)
+        body.extend(chunk)
+        if len(body) > limit:
+            raise AuthError("provider_body_too_large")
+
+
 def fetch_json(url, form=None):
     request = urllib.request.Request(url)
     if form is not None:
@@ -42,7 +56,7 @@ def fetch_json(url, form=None):
         request.add_header("Content-Type", "application/x-www-form-urlencoded")
     try:
         with HTTP.open(request, timeout=30) as response:
-            return json.loads(response.read(2_000_001))
+            return json.loads(bounded_body(response, 2_000_000, 30))
     except Exception:
         raise AuthError("provider_request_failed") from None
 
@@ -98,13 +112,21 @@ class Store:
             os.close(directory)
 
     @contextlib.contextmanager
-    def lock(self):
+    def lock(self, timeout=30):
         fd = os.open(self.path("auth.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             s = os.fstat(fd)
             if not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o600 or s.st_nlink != 1:
                 raise AuthError("unsafe_lock")
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise AuthError("auth_lock_timeout") from None
+                    time.sleep(0.01)
             yield
         finally:
             os.close(fd)
@@ -253,9 +275,33 @@ class Auth:
                     "refresh_token": record["refresh_token"], "resource": RESOURCE})
                 record = self.token_record(response, record)
                 record["refresh_count"] = record.get("refresh_count", 0) + 1
+                record["last_refresh_at"] = time.time()
                 accounts[active["account"]] = record
                 self.store.write("accounts.json", accounts)
             return record["access_token"]
+
+    def token_values(self):
+        """Internal redaction input only; never part of an admin response."""
+        with self.store.lock():
+            return {record[field] for record in self.store.read("accounts.json", {}).values()
+                    for field in ("access_token", "refresh_token", "id_token") if record.get(field)}
+
+    def status(self):
+        """Metadata projection only. Does not call access() or refresh implicitly."""
+        with self.store.lock():
+            active = self.store.read("active.json", {}) or {}
+            records = self.store.read("accounts.json", {})
+            record = records.get(active.get("account"), {})
+            result = {"signed_in": bool(record.get("access_token")), "client_id": record.get("client_id"),
+                      "ext_agent_host_id": self.host_id, "scopes": record.get("scopes", []),
+                      "expires_at": record.get("expires_at"), "refresh_count": record.get("refresh_count", 0),
+                      "last_refresh_at": record.get("last_refresh_at")}
+            # Even malformed metadata cannot echo a stored credential.
+            encoded = json.dumps(result)
+            if any(record.get(field) and record[field] in encoded
+                   for record in records.values() for field in ("access_token", "refresh_token", "id_token")):
+                raise AuthError("unsafe_session_metadata")
+            return result
 
     def accounts(self):
         with self.store.lock():

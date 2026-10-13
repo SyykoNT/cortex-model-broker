@@ -1,4 +1,4 @@
-"""Provider transport with fail-closed capture. Not enabled by the setup server."""
+"""Provider transport with fail-closed capture; worker admission is separate."""
 import datetime
 import hashlib
 import json
@@ -6,12 +6,14 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import stat
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
 
-from .auth import HTTP
+from .auth import HTTP, bounded_body
 from .protocol import Refusal, adapt, reconstruct_sse
 
 
@@ -20,14 +22,25 @@ class Capture:
     def __init__(self, directory, scanner, capture_health):
         self.root = Path(directory)
         self.root.mkdir(mode=0o750, parents=True, exist_ok=True)
+        s = self.root.lstat()
+        if (not stat.S_ISDIR(s.st_mode) or s.st_uid != os.geteuid() or s.st_mode & 0o027):
+            raise Refusal('capture_unavailable')
+        self.root_identity = (s.st_dev, s.st_ino)
         self.scanner = scanner
         self.capture_health = capture_health
         self.lock = threading.Lock()
+        self.secrets = set()
+
+    def remember_secrets(self, values):
+        with self.lock:
+            self.secrets.update(v for v in values if isinstance(v, str) and v)
 
     def safe(self, value):
         # Header dictionaries are never passed by the transport. Explicit credential
         # fields are removed even if a detector would miss their particular format.
         redactions = []
+        with self.lock:
+            known = sorted(self.secrets, key=len, reverse=True)
         def clean(obj):
             if isinstance(obj, dict):
                 result = {}
@@ -35,11 +48,15 @@ class Capture:
                     if k.lower() in {'authorization', 'proxy-authorization', 'access_token', 'refresh_token', 'id_token', 'api_key', 'password', 'client_secret'}:
                         result[k] = '[REDACTED]'; redactions.append('credential-field')
                     else:
-                        result[k] = clean(v)
+                        result[clean(k)] = clean(v)
                 return result
             if isinstance(obj, list):
                 return [clean(v) for v in obj]
             if isinstance(obj, str):
+                for secret in known:
+                    if secret in obj:
+                        obj = obj.replace(secret, "[REDACTED]")
+                        redactions.append("known-credential")
                 value, count = re.subn(r'(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*', 'Bearer [REDACTED]', obj)
                 if count:
                     redactions.append('bearer-value')
@@ -49,7 +66,8 @@ class Capture:
         encoded = json.dumps(cleaned, ensure_ascii=True).encode()
         result = subprocess.run([self.scanner, 'stdin', '--redact', '--no-banner', '--log-level', 'error'],
                                 input=encoded, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                timeout=30, env={'PATH': '/usr/bin:/bin', 'HOME': str(self.root)})
+                                timeout=30, cwd=self.root,
+                                env={'PATH': '/usr/bin:/bin', 'HOME': str(self.root)})
         if result.returncode == 1:
             # Never put a detected secret in an artifact, including a scanner report.
             cleaned = {'redacted_body': 'gitleaks-match'}
@@ -61,8 +79,8 @@ class Capture:
     def append(self, run_id, kind, value):
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,160}', run_id):
             raise Refusal('invalid_run_id')
-        # No stubs or existence-only readiness: the deployment callback must test
-        # all three live capture sources. Failure propagates before model dispatch.
+        # Readiness is scoped by composition: broker-only fixed admin acceptance
+        # is not worker admission. Worker traffic requires all three sources.
         if self.capture_health() is not True:
             raise Refusal('capture_unavailable')
         cleaned, redactions = self.safe(value)
@@ -71,12 +89,27 @@ class Capture:
                'flags': ['secret'] if redactions else [], 'redactions': redactions}
         line = (json.dumps(row, separators=(',', ':')) + '\n').encode()
         with self.lock:
-            fd = os.open(self.root / (run_id + '.jsonl'), os.O_APPEND | os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o640)
+            directory = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
-                with os.fdopen(fd, 'ab', closefd=False) as f:
-                    f.write(line); f.flush(); os.fsync(fd)
+                s = os.fstat(directory)
+                if ((s.st_dev, s.st_ino) != self.root_identity or s.st_uid != os.geteuid()
+                        or s.st_mode & 0o027):
+                    raise Refusal('capture_unavailable')
+                fd = os.open(run_id + '.jsonl', os.O_APPEND | os.O_CREAT | os.O_WRONLY
+                             | os.O_NOFOLLOW | os.O_NONBLOCK, 0o640, dir_fd=directory)
+                try:
+                    s = os.fstat(fd)
+                    if (not stat.S_ISREG(s.st_mode) or s.st_uid != os.geteuid()
+                            or s.st_nlink != 1 or s.st_mode & 0o027):
+                        raise Refusal('capture_unavailable')
+                    with os.fdopen(fd, 'ab', closefd=False) as f:
+                        f.write(line); f.flush(); os.fsync(fd)
+                    # A newly created run must survive a directory replay too.
+                    os.fsync(directory)
+                finally:
+                    os.close(fd)
             finally:
-                os.close(fd)
+                os.close(directory)
         return row
 
 
@@ -85,14 +118,18 @@ class Transport:
     def __init__(self, auth, keys, capture, on_limit, opener=HTTP):
         self.auth, self.keys, self.capture, self.on_limit, self.opener = auth, keys, capture, on_limit, opener
 
+    def access(self):
+        token = self.auth.access()
+        values = self.auth.token_values() if hasattr(self.auth, "token_values") else {token}
+        self.capture.remember_secrets(values | {token})
+        return token
+
     def models(self, run_id):
         self.capture.append(run_id, 'models.request', {'endpoint': 'https://api.openai.com/v1/models'})
-        request = urllib.request.Request('https://api.openai.com/v1/models', headers={'Authorization': 'Bearer ' + self.auth.access()})
+        request = urllib.request.Request('https://api.openai.com/v1/models', headers={'Authorization': 'Bearer ' + self.access()})
         try:
             with self.opener.open(request, timeout=60) as response:
-                body = response.read(8_000_001)
-                if len(body) > 8_000_000:
-                    raise Refusal('model_catalog_too_large')
+                body = bounded_body(response, 8_000_000, 60)
                 data = json.loads(body)
         except Exception:
             self.capture.append(run_id, 'models.failed', {'error': 'provider_request_failed'})
@@ -103,14 +140,20 @@ class Transport:
         return data
 
     def responses(self, run_key, request, emit):
-        admission = self.keys.admit(run_key, request)
+        try:
+            admission = self.keys.admit(run_key, request)
+        except Refusal as error:
+            run = self.keys.run_for_key(run_key) or "denied-" + uuid.uuid4().hex
+            self.capture.append(run, "request.refused", {"error": str(error)})
+            raise
         run = admission['run_id']
         call_id = str(uuid.uuid4())
         self.capture.append(run, 'request.received', {'call_id': call_id, 'request': request, 'admission': admission})
         payload, changes = adapt(request)
         self.capture.append(run, 'request.upstream', {'call_id': call_id, 'request': payload, 'adaptations': changes})
         upstream = urllib.request.Request('https://api.openai.com/v1/responses', data=json.dumps(payload).encode(),
-            headers={'Authorization': 'Bearer ' + self.auth.access(), 'Content-Type': 'application/json', 'Accept': 'text/event-stream'})
+            headers={'Authorization': 'Bearer ' + self.access(), 'Content-Type': 'application/json', 'Accept': 'text/event-stream'})
+        deadline = time.monotonic() + 120
         chunks = []
         size = 0
         status = None
@@ -122,6 +165,8 @@ class Transport:
             with response:
                 status = response.status
                 while True:
+                    if time.monotonic() >= deadline:
+                        raise Refusal('provider_deadline')
                     chunk = response.read1(65536)
                     if not chunk:
                         break
