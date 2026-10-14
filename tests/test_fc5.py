@@ -128,7 +128,8 @@ class Loopback:
 class FC5Tests(unittest.TestCase):
     def setUp(self):
         self.assertTrue(os.environ.get('TEST_GITLEAKS'), 'existing real scanner required')
-        self.tmp = tempfile.TemporaryDirectory()
+        # Match the admin fixtures: the system default may have writable ancestors.
+        self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', Path.cwd()))
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.auth, self.keys, self.provider = SyntheticAuth(), RunKeys(), Loopback()
@@ -151,6 +152,12 @@ class FC5Tests(unittest.TestCase):
 
     def rows(self, run):
         return [json.loads(line) for line in (self.capture.root / (run + '.jsonl')).read_text().splitlines()]
+
+    def test_fixture_parent_honors_tmpdir_or_cwd(self):
+        self.assertEqual(
+            Path(os.environ.get('TMPDIR', Path.cwd())).resolve(),
+            self.root.parent.resolve(),
+        )
 
     def test_two_calls_full_context_durable_replay_and_no_worker_admission(self):
         for header in ('text/event-stream', 'application/json', None):
