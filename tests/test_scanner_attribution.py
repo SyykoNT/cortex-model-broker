@@ -117,12 +117,19 @@ class AttributionTests(unittest.TestCase):
         values = [{CANARY: 'value'}, {'attacker-key': CANARY},
                   {'request': {'tools': [{'parameters': {'properties': {'id': CANARY}}}]}},
                   {'reconstructed': {'response': {'output': [{'type': 'attacker-type', 'id': CANARY}]}}},
-                  {'body': CANARY}, {'reconstructed': {'response': {'id': {'nested': CANARY}}}}]
+                  {'reconstructed': {'response': {'id': {'nested': CANARY}}}}]
         for value in values:
             with self.subTest(shape=list(value)):
                 for loc in self.detected(value):
                     self.assertEqual('unknown', loc['field_path'])
                     self.assertEqual('unknown', loc['field_class'])
+
+        # Version 5 distinguishes an unparsed body from unsupported outer
+        # metadata, without promoting it to an opaque/model-output field.
+        body_evidence = self.detected({'body': CANARY})
+        self.assertEqual(['body'], [loc['field_path'] for loc in body_evidence])
+        self.assertEqual(['unclassified_response_body'], [loc['field_class'] for loc in body_evidence])
+        self.assertTrue(all(loc['field_class'] == 'unknown' for loc in self.detected({'body': CANARY}, primary=True)))
 
     def test_invalid_or_ambiguous_sse_stays_unknown(self):
         data = '{"type":"response.completed","response":{"id":"' + CANARY + '"}}'

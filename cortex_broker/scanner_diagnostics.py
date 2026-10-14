@@ -11,7 +11,7 @@ import subprocess
 import time
 
 from .protocol import Refusal
-from .scanner_attribution import attribute
+from .scanner_attribution import attribute, response_shape
 
 MAX_REPORT = 4_000_000
 MAX_FINDINGS = 4096
@@ -149,7 +149,7 @@ def _project(status, raw, encoded, content):
                                 coordinate_space='scanner_local', attribution_reason=(
                                     'secondary_not_run' if finding.get('Tags') == []
                                     else 'primary_unsupported_tags'))
-        summary = {'version': 4, 'finding_count': len(report), 'rules': [
+        summary = {'version': 5, 'finding_count': len(report), 'rules': [
             {'rule_id': rule, 'count': len(locations), 'locations': locations}
             for rule, locations in sorted(rules.items())]}
         # Discard every other raw finding field before content verification.
@@ -208,6 +208,12 @@ def _enrich(primary, scanner, encoded, root):
     """
     import copy
     result = copy.deepcopy(primary)
+    try:
+        result['response_shape'] = response_shape(encoded)
+    except Exception:
+        # Shape is independent of both scanner passes; failure must not prevent
+        # secondary evidence, mutate primary authority or leak private strings.
+        pass
     secondary, reason = _secondary(scanner, encoded, root)
     if secondary is not None:
         signature = lambda summary: (summary['finding_count'], [
