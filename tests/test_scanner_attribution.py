@@ -9,6 +9,7 @@ from unittest.mock import patch
 from cortex_broker import scanner_attribution as attribution
 from cortex_broker.scanner_diagnostics import project, run_scanner, scan
 from cortex_broker.traffic import Capture
+from test_content_origin import evidence
 
 # Deliberately synthetic and assembled so the fixture source is not a credential.
 CANARY = 'gh' + 'p_' + '0123456789abcdef' * 2 + 'abcd'
@@ -34,23 +35,28 @@ class AttributionTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.scanner = os.environ['TEST_GITLEAKS']
 
-    def detected(self, value):
+    def detected(self, value, *, primary=False):
         result = scan(self.scanner, encode(value), self.root)
         self.assertIsNotNone(result)
         self.assertNotIn(CANARY, json.dumps(result))
-        return locations(result)
+        self.assertTrue(all(loc['field_path'] == loc['field_class'] == 'unknown'
+                            for loc in locations(result)))
+        # Content claims belong only to independent secondary evidence. Tests
+        # needing real primary counts/coordinates request that projection explicitly.
+        return locations(result) if primary else evidence(result)
 
     def test_real_request_unicode_escapes_and_duplicate_values(self):
         value = {'request': {'instructions': 'é😀\\\"\n' + CANARY,
                             'input': [{'role': 'user', 'content': CANARY},
                                       {'type': 'function_call_output', 'output': CANARY}]}}
-        result = self.detected(value)
-        self.assertEqual(['request.instructions', 'request.input[].content',
-                          'request.input[].output'], [x['field_path'] for x in result])
+        result = self.detected(value, primary=True)
+        self.assertTrue(all(e['field_class'] == 'unknown' for e in self.detected(value)))
+        # Identical matches in different paths have no proven origin.
+        self.assertEqual(['unknown'] * 3, [x['field_path'] for x in result])
         encoded = encode(value)
         for loc in result:
             self.assertEqual(CANARY.encode(), encoded[loc['start_column']-1:loc['end_column']])
-            self.assertEqual('request_content', loc['field_class'])
+            self.assertEqual('unknown', loc['field_class'])
 
     def test_real_typed_response_fields(self):
         for item_type, field, expected in [('message', 'id', 'message_id'),
@@ -73,13 +79,11 @@ class AttributionTests(unittest.TestCase):
             body = '\ufeff: comment' + newline + 'event: response.completed' + newline
             body += 'data: ' + json.dumps(event, ensure_ascii=False) + newline * 2
             value = {'body': body, 'reconstructed': {'events': [event], 'response': event['response']}}
-            result = self.detected(value)
+            result = self.detected(value, primary=True)
+            self.assertTrue(all(e['field_class'] == 'unknown' for e in self.detected(value)))
             self.assertEqual(9, len(result))
-            self.assertEqual(['body.sse[].response.id', 'body.sse[].response.output[].id',
-                             'body.sse[].response.output[].content[].text'],
-                             [x['field_path'] for x in result[:3]])
-            self.assertEqual(['response_id', 'message_id', 'output_text'] * 3,
-                             [x['field_class'] for x in result])
+            self.assertEqual(['unknown'] * 9, [x['field_path'] for x in result])
+            self.assertEqual(['unknown'] * 9, [x['field_class'] for x in result])
             for loc in result:
                 self.assertEqual(CANARY.encode(), encode(value)[loc['start_column']-1:loc['end_column']])
 
@@ -105,7 +109,8 @@ class AttributionTests(unittest.TestCase):
         marker = 'api_key = ' + 'Ab3cD4eF5gH6iJ7kL8mN9pQ0rS1tU2vW'
         summary = scan(self.scanner, encode({'request': {'instructions': marker}}), self.root)
         self.assertEqual('generic-api-key', summary['rules'][0]['rule_id'])
-        self.assertEqual('request.instructions', locations(summary)[0]['field_path'])
+        self.assertEqual('unknown', locations(summary)[0]['field_path'])
+        self.assertEqual('request.instructions', evidence(summary)[0]['field_path'])
         self.assertNotIn(marker, json.dumps(summary))
 
     def test_unknown_keys_types_and_nested_model_controlled_schema(self):
@@ -132,6 +137,7 @@ class AttributionTests(unittest.TestCase):
         start, end = raw.index(b'first'), raw.index(b'second') + len(b'second')
         for f in [finding(start, end), finding(0, len(raw)+10), finding(start, start+2, 2),
                   finding(raw.index(b'instructions'), raw.index(b'instructions')+3)]:
+            f['Match'] = raw[f['StartColumn']-1:f['EndColumn']].decode()
             result = project(1, json.dumps([f]).encode(), raw)
             self.assertEqual('unknown', locations(result)[0]['field_path'])
 
@@ -139,7 +145,7 @@ class AttributionTests(unittest.TestCase):
         for raw in [b'{"request":{"instructions":"x","instructions":"y"}}',
                     b'{\n"request":{"instructions":"x"}}',
                     '{"request":{"instructions":"é"}}'.encode(), b'not json']:
-            result = project(1, json.dumps([finding(0, len(raw))]).encode(), raw)
+            result = project(1, json.dumps([{**finding(0, len(raw)), 'Match': raw.decode()}]).encode(), raw)
             self.assertEqual('unknown', locations(result)[0]['field_path'])
 
     def test_budgets_and_attribution_failure_keep_whole_redaction(self):
@@ -151,9 +157,11 @@ class AttributionTests(unittest.TestCase):
                 self.assertEqual('gitleaks-match', cleaned['redacted_body'])
                 self.assertEqual(['gitleaks'], flags)
                 self.assertEqual('unknown', locations(cleaned['scanner_diagnostics'])[0]['field_path'])
+                self.assertEqual('unknown', evidence(cleaned['scanner_diagnostics'])[0]['field_path'])
         with patch.object(attribution, 'build_spans', side_effect=ValueError('unsafe-content')):
             cleaned, flags = capture.safe({'request': {'instructions': CANARY}})
             self.assertEqual('unknown', locations(cleaned['scanner_diagnostics'])[0]['field_path'])
+            self.assertEqual('unknown', evidence(cleaned['scanner_diagnostics'])[0]['field_path'])
             self.assertNotIn('unsafe-content', json.dumps(cleaned))
 
     def test_success_never_parses_or_mutates(self):
@@ -170,8 +178,20 @@ class AttributionTests(unittest.TestCase):
         event = {'type': 'response.completed', 'response': {'id': prefix + CANARY}}
         for ensure_ascii in (True, False):
             body = 'data: ' + json.dumps(event, ensure_ascii=ensure_ascii) + '\n\n'
-            result = self.detected({'body': body})
+            encoded = encode({'body': body})
+            # Preserve direct real-binary Unicode proof coverage. This fixture
+            # ALSO triggers a decoded/tagged finding of the same rule; its
+            # mixed evidence cannot be linked individually across two passes.
+            status, report = run_scanner(self.scanner, encoded, self.root, diagnostic=True)
+            result = locations(project(status, report, encoded))
+            report = None
             self.assertEqual('body.sse[].response.id', result[0]['field_path'])
+            summary = scan(self.scanner, encoded, self.root)
+            rule = next(r for r in summary['rules'] if r['rule_id'] == 'github-pat')
+            self.assertIn({'field_path': 'body.sse[].response.id', 'field_class': 'response_id',
+                           'attribution_reason': 'exact_all_occurrences'}, rule['field_evidence'])
+            self.assertTrue(any(e['attribution_reason'] == 'tags_unsupported' for e in rule['field_evidence']))
+            self.assertTrue(all(loc['field_path'] == 'unknown' for loc in rule['locations']))
 
     def test_sse_crossfield_crossframe_and_assignment_bounds(self):
         event = {'type': 'response.completed', 'response': {'id': 'first',
@@ -179,33 +199,34 @@ class AttributionTests(unittest.TestCase):
         raw = encode({'body': 'data: ' + json.dumps(event) + '\n\n'})
         first, second = raw.index(b'first'), raw.index(b'second')
         for start, end in [(first, second+6), (first, len(raw)), (0, first+2)]:
-            result = project(1, json.dumps([finding(start, end)]).encode(), raw)
+            result = project(1, json.dumps([{**finding(start, end), 'Match': raw[start:end].decode()}]).encode(), raw)
             self.assertEqual('unknown', locations(result)[0]['field_path'])
         # Gitleaks can include a scalar member's assignment in its match.
         raw = encode({'reconstructed': {'response': {'id': 'synthetic'}}})
         start = raw.index(b'"id"')
         end = raw.index(b'synthetic') + len(b'synthetic') + 1
-        result = project(1, json.dumps([finding(start, end)]).encode(), raw)
+        result = project(1, json.dumps([{**finding(start, end), 'Match': raw[start:end].decode()}]).encode(), raw)
         self.assertEqual('reconstructed.response.id', locations(result)[0]['field_path'])
 
-    def test_real_single_fragment_boundary_and_large_unknown(self):
+    def test_real_single_fragment_boundary_and_large_recovered(self):
         overhead = len(encode({'request': {'instructions': CANARY}}))
-        for length in (8192, 16384, attribution.MAX_INPUT):
+        for length in (8192, 16384, 25000):
             raw = encode({'request': {'instructions': ' ' * (length - overhead) + CANARY}})
             self.assertEqual(length, len(raw))
-            loc = locations(scan(self.scanner, raw, self.root))[0]
+            summary = scan(self.scanner, raw, self.root)
+            loc = locations(summary)[0]
             self.assertEqual(CANARY.encode(), raw[loc['start_column']-1:loc['end_column']])
-            self.assertEqual('request.instructions', loc['field_path'])
-        # Large inputs may or may not fragment depending on pipe reads. Refuse
-        # attribution regardless of whether reported columns happen to be global.
-        # The controlled small-pipe test separately covers the harmful reset.
+            self.assertEqual('unknown', loc['field_path'])
+            self.assertEqual('request.instructions', evidence(summary)[0]['field_path'])
+        # Content proof no longer relies on fragment-local columns.
         for length in (32769, 65536, 1048576):
             raw = encode({'request': {'instructions': ' ' * (length - overhead) + CANARY}})
             summary = scan(self.scanner, raw, self.root)
             self.assertEqual(1, summary['finding_count'])
-            loc = locations(summary)[0]
-            self.assertEqual('unknown', loc['field_path'])
-            self.assertEqual('unknown', loc['field_class'])
+            self.assertEqual('unknown', locations(summary)[0]['field_path'])
+            loc = evidence(summary)[0]
+            self.assertEqual('request.instructions', loc['field_path'])
+            self.assertEqual('request_content', loc['field_class'])
 
     def test_small_pipe_fragment_cannot_mislabel_output_as_reasoning(self):
         import subprocess
@@ -225,14 +246,15 @@ class AttributionTests(unittest.TestCase):
         with patch('cortex_broker.scanner_diagnostics.subprocess.Popen', small_pipe):
             summary = scan(self.scanner, raw, self.root)
         self.assertEqual(1, summary['finding_count'])
-        loc = locations(summary)[0]
-        self.assertEqual('unknown', loc['field_class'])
-        self.assertEqual('unknown', loc['field_path'])
+        self.assertEqual('unknown', locations(summary)[0]['field_class'])
+        loc = evidence(summary)[0]
+        self.assertEqual('output_text', loc['field_class'])
+        self.assertEqual('reconstructed.response.output[].content[].text', loc['field_path'])
         self.assertNotIn(CANARY, json.dumps(summary))
 
     def test_small_pipe_source_bound_and_first_byte_above_bound(self):
         import subprocess
-        self.assertEqual(25000, attribution.MAX_INPUT)
+        self.assertGreater(attribution.MAX_INPUT, 25000)
         original = subprocess.Popen
         def small_pipe(*args, **kwargs):
             kwargs['pipesize'] = 4096
@@ -246,29 +268,31 @@ class AttributionTests(unittest.TestCase):
                     summary = scan(self.scanner, raw, self.root)
                 self.assertEqual(1, summary['finding_count'])
                 loc = locations(summary)[0]
-                expected = 'request_content' if length <= 25000 else 'unknown'
-                self.assertEqual(expected, loc['field_class'])
+                self.assertEqual('unknown', loc['field_class'])
+                self.assertEqual('request_content', evidence(summary)[0]['field_class'])
                 if length <= 25000:
                     self.assertEqual(CANARY.encode(), raw[loc['start_column']-1:loc['end_column']])
 
     def test_decoded_and_unsupported_report_tags_unknown(self):
         import base64
         raw = encode({'request': {'instructions': base64.b64encode(CANARY.encode()).decode()}})
-        self.assertEqual('unknown', locations(scan(self.scanner, raw, self.root))[0]['field_path'])
+        summary = scan(self.scanner, raw, self.root)
+        self.assertEqual('unknown', locations(summary)[0]['field_path'])
+        self.assertEqual('unknown', evidence(summary)[0]['field_path'])
         raw = encode({'request': {'instructions': CANARY}})
         start = raw.index(CANARY.encode())
         for tags in (None, ['decoded:base64'], ['arbitrary-model-controlled-value'], 'invalid'):
-            report = json.dumps([{**finding(start, start+len(CANARY)), 'Tags': tags}]).encode()
+            report = json.dumps([{**finding(start, start+len(CANARY)), 'Match': CANARY, 'Tags': tags}]).encode()
             result = project(1, report, raw)
             self.assertEqual('unknown', locations(result)[0]['field_path'])
             self.assertNotIn('arbitrary-model-controlled-value', json.dumps(result))
 
     def test_actual_node_depth_and_body_limits(self):
         raw = encode({'request': {'instructions': 'x'}, 'unknown': [0] * attribution.MAX_NODES})
-        loc = locations(project(1, json.dumps([finding(raw.index(b'"x"')+1, raw.index(b'"x"')+2)]).encode(), raw))[0]
+        loc = locations(project(1, json.dumps([{**finding(raw.index(b'"x"')+1, raw.index(b'"x"')+2), 'Match': 'x'}]).encode(), raw))[0]
         self.assertEqual('unknown', loc['field_path'])
         raw = b'{"request":{"instructions":"x"},"unknown":' + b'[' * 50 + b'0' + b']' * 50 + b'}'
-        loc = locations(project(1, json.dumps([finding(raw.index(b'"x"')+1, raw.index(b'"x"')+2)]).encode(), raw))[0]
+        loc = locations(project(1, json.dumps([{**finding(raw.index(b'"x"')+1, raw.index(b'"x"')+2), 'Match': 'x'}]).encode(), raw))[0]
         self.assertEqual('unknown', loc['field_path'])
         body = ':' + 'x' * attribution.MAX_BODY + '\n\ndata: ' + json.dumps({'type': 'response.completed', 'response': {'id': CANARY}}) + '\n\n'
         self.assertEqual('unknown', self.detected({'body': body})[0]['field_path'])
@@ -282,7 +306,8 @@ class AttributionTests(unittest.TestCase):
             self.assertEqual({'redacted_body', 'scanner_diagnostics'}, set(row['data']))
             self.assertEqual(['secret'], row['flags'])
             self.assertEqual(['gitleaks'], row['redactions'])
-            self.assertNotEqual('unknown', locations(row['data']['scanner_diagnostics'])[0]['field_path'])
+            self.assertEqual('unknown', locations(row['data']['scanner_diagnostics'])[0]['field_path'])
+            self.assertNotEqual('unknown', evidence(row['data']['scanner_diagnostics'])[0]['field_path'])
         text = (self.root / 'safe-metadata.jsonl').read_text()
         self.assertNotIn(CANARY, text)
         for forbidden in ('Secret', 'Match', 'Entropy', 'Fingerprint', 'Description', 'unsafe-content'):

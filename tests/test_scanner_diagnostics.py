@@ -26,13 +26,13 @@ class ScannerDiagnosticsTests(unittest.TestCase):
         self.assertEqual(['gitleaks'], row['redactions'])
         self.assertEqual('gitleaks-match', row['data']['redacted_body'])
         diagnostics = row['data']['scanner_diagnostics']
-        self.assertEqual({'version', 'finding_count', 'rules'}, set(diagnostics))
+        self.assertEqual({'version', 'finding_count', 'rules', 'encoded_byte_count'}, set(diagnostics))
         self.assertEqual(1, diagnostics['finding_count'])
         self.assertEqual('github-pat', diagnostics['rules'][0]['rule_id'])
         self.assertEqual(1, diagnostics['rules'][0]['count'])
         for location in diagnostics['rules'][0]['locations']:
             self.assertEqual({'start_line', 'end_line', 'start_column', 'end_column',
-                              'field_path', 'field_class'}, set(location))
+                              'field_path', 'field_class', 'coordinate_space', 'attribution_reason'}, set(location))
             self.assertTrue(all(type(location[k]) is int and location[k] > 0
                                 for k in ('start_line', 'end_line', 'start_column', 'end_column')))
             self.assertEqual('unknown', location['field_path'])

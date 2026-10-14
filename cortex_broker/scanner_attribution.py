@@ -1,10 +1,8 @@
-"""Bounded, ephemeral source positions; only static schema labels may escape.
+"""Diagnostic-only exact-content origin proof; NEVER a scanner exemption.
 
-This is diagnostics, NEVER a scanner exemption or a redaction decision. We index
-syntax, not matching values: repeated strings retain distinct source positions.
-Capture emits unindented ensure_ascii JSON. Only its single-line byte coordinates
-are supported (gitleaks 8.30.1 has a different column origin after an actual LF).
-Unknown keys, shapes, overlapping fields, invalid framing and budgets stay unknown.
+Index static syntax, then verify ALL exact occurrences of the complete transient
+scanner Match. Scanner-local columns are not source offsets, even when content
+at those columns happens to match. Raw values never enter the public projection.
 """
 from array import array
 from bisect import bisect_right
@@ -12,16 +10,15 @@ from dataclasses import dataclass, field
 import json
 import re
 
-# Pinned stdin scanning resets columns in larger fragments without publishing
-# their byte origins. Do not infer global offsets from those reports. This is
-# an attribution-only cap: the unchanged scanner still sees the ENTIRE value.
-# v8.30.1 sources/common.go extends any nonempty initial read by up to 25,000
-# bytes. Our ASCII/no-CR-or-LF input <=25,000 therefore reaches EOF within the
-# first fragment regardless of short pipe reads. Sender write size is NOT a
-# reader-boundary guarantee. See docs/scanner-diagnostics.md for pinned source.
-MAX_INPUT = 25_000
-MAX_BODY = 32_768
-MAX_NODES = 4096
+# Diagnostic budgets, independent of scanner input (which is never truncated).
+# Input/body cap matches the existing 4 MB report budget; search work is capped
+# at the transport's 64 MB response ceiling. Nodes scale at <=1 per 64 input
+# bytes, with the prior 4096-node floor and a bounded 65,536-node ceiling.
+MAX_INPUT = 4_000_000
+MAX_BODY = MAX_INPUT
+MAX_NODES = 65_536
+MAX_WORK = 64_000_000
+MAX_OCCURRENCES = 4096
 MAX_DEPTH = 48
 SPACE = re.compile(r'[ \t\r\n]*')
 DECODER = json.JSONDecoder(parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
@@ -47,8 +44,8 @@ class Node:
 
 
 class Parser:
-    def __init__(self):
-        self.remaining = MAX_NODES
+    def __init__(self, size):
+        self.remaining = min(MAX_NODES, max(4096, size // 64))
 
     def parse(self, text):
         def ws(i):
@@ -114,7 +111,7 @@ def build_spans(encoded):
     if type(encoded) is not bytes or len(encoded) > MAX_INPUT or not encoded.isascii() or b'\n' in encoded or b'\r' in encoded:
         raise ValueError()
     text = encoded.decode('ascii')
-    parser = Parser()
+    parser = Parser(len(encoded))
     root = parser.parse(text)
     spans = []
 
@@ -319,25 +316,79 @@ def build_spans(encoded):
     return spans
 
 
-def attribute(summary, encoded):
-    """Metadata failure cannot turn a scanner match into an accepted value."""
-    spans = []
+def attribute(summary, encoded, transient):
+    """Consume private (location, Match, supported-tags) triples; return labels only.
+
+    Every exact overlapping occurrence must fit one known scalar member, overlap
+    its value, and agree on BOTH normalized path and class. No reported offset is
+    used for origin recovery. Length only detects incomplete/malformed Match data.
+    Search and occurrence budgets are shared across the entire report.
+    """
+    summary['encoded_byte_count'] = len(encoded) if type(encoded) is bytes else None
+    for location, _, _ in transient:
+        location.update(field_path='unknown', field_class='unknown',
+                        coordinate_space='scanner_local', attribution_reason='input_unsupported')
+    if type(encoded) is not bytes:
+        return summary
+    if len(encoded) > MAX_INPUT:
+        for location, _, _ in transient:
+            location['attribution_reason'] = 'input_budget'
+        return summary
     try:
         spans = build_spans(encoded)
     except Exception:
-        # No exception text (which might include content) enters diagnostics.
-        pass
+        for location, _, _ in transient:
+            location['attribution_reason'] = 'structure_unsupported_or_budget'
+        return summary
     starts = [s[0] for s in spans]
-    for rule in summary['rules']:
-        for location in rule['locations']:
-            location.update(field_path='unknown', field_class='unknown')
-            if location['start_line'] != 1 or location['end_line'] != 1:
-                continue
-            start, end = location['start_column'] - 1, location['end_column']
+    work, occurrences = MAX_WORK, MAX_OCCURRENCES
+    for location, match, supported in transient:
+        location['attribution_reason'] = 'match_unsupported'
+        if not supported:
+            location['attribution_reason'] = 'tags_unsupported'
+            continue
+        # The capture is ASCII single-line JSON. For an untagged pinned scanner
+        # report the complete Match has exactly this byte width, even when the
+        # columns reset. Never repair, strip, decode or search a Match substring.
+        if (type(match) is not str or not match or not match.isascii() or
+                location['start_line'] != 1 or location['end_line'] != 1 or
+                len(match) != location['end_column'] - location['start_column'] + 1):
+            continue
+        needle = match.encode('ascii')
+        cursor, label = 0, None
+        reason = 'match_absent'
+        while True:
+            # Charge conservatively for every find, including its absent tail.
+            cost = len(encoded) - cursor + len(needle)
+            if cost > work:
+                reason = 'search_budget'
+                break
+            work -= cost
+            start = encoded.find(needle, cursor)
+            if start < 0:
+                if label is not None:
+                    reason = 'exact_all_occurrences'
+                break
+            if occurrences <= 0:
+                reason = 'occurrence_budget'
+                break
+            occurrences -= 1
+            end = start + len(needle)
             i = bisect_right(starts, start) - 1
             if i < 0:
-                continue
+                reason = 'occurrence_outside_field'
+                break
             left, right, value_start, value_end, path, cls = spans[i]
-            if left <= start < end <= right and start < value_end and end > value_start:
-                location.update(field_path=path, field_class=cls)
+            if not (left <= start < end <= right and value_start < value_end
+                    and start < value_end and end > value_start):
+                reason = 'occurrence_outside_field'
+                break
+            if label is not None and label != (path, cls):
+                reason = 'occurrence_ambiguous'
+                break
+            label = (path, cls)
+            cursor = start + 1  # Include overlapping exact occurrences.
+        location['attribution_reason'] = reason
+        if reason == 'exact_all_occurrences':
+            location.update(field_path=label[0], field_class=label[1])
     return summary
