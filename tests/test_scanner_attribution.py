@@ -196,14 +196,16 @@ class AttributionTests(unittest.TestCase):
             loc = locations(scan(self.scanner, raw, self.root))[0]
             self.assertEqual(CANARY.encode(), raw[loc['start_column']-1:loc['end_column']])
             self.assertEqual('request.instructions', loc['field_path'])
-        # Reproduce fragment-local coordinates. Never use these columns as
-        # whole-input offsets, even when they happen to land on a known field.
+        # Large inputs may or may not fragment depending on pipe reads. Refuse
+        # attribution regardless of whether reported columns happen to be global.
+        # The controlled small-pipe test separately covers the harmful reset.
         for length in (32769, 65536, 1048576):
             raw = encode({'request': {'instructions': ' ' * (length - overhead) + CANARY}})
-            loc = locations(scan(self.scanner, raw, self.root))[0]
+            summary = scan(self.scanner, raw, self.root)
+            self.assertEqual(1, summary['finding_count'])
+            loc = locations(summary)[0]
             self.assertEqual('unknown', loc['field_path'])
-            if length >= 65536:
-                self.assertNotEqual(raw.index(CANARY.encode()) + 1, loc['start_column'])
+            self.assertEqual('unknown', loc['field_class'])
 
     def test_small_pipe_fragment_cannot_mislabel_output_as_reasoning(self):
         import subprocess
