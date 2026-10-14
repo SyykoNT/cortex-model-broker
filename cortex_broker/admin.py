@@ -12,6 +12,7 @@ import time
 import uuid
 
 from .protocol import Refusal, classify_response, reconstruct_sse
+from . import fc5
 
 MAX_REQUEST = 16_384
 MAX_RESPONSE = 65_536
@@ -170,7 +171,7 @@ SAFE_ERRORS = set('''invalid_request peer_not_allowed request_timeout request_to
 response_too_large operation_failed capture_unavailable worker_admission_disabled
 invalid_run_id unapproved_model_or_reasoning invalid_budget reconstruction_unavailable
 inference_not_completed inference_model_mismatch inference_reasoning_mismatch usage_unavailable codex_unavailable
-codex_timeout codex_protocol_error codex_rate_limits_unavailable'''.split())
+codex_timeout codex_protocol_error codex_rate_limits_unavailable tool_probe_invalid'''.split())
 
 
 def validate_run(run):
@@ -225,7 +226,7 @@ class Controller:
         return result
 
     def _dispatch(self, request):
-        schemas = {'status': set(), 'models': set(), 'refresh': set(), 'rate_limits': set(),
+        schemas = {'status': set(), 'models': set(), 'refresh': set(), 'rate_limits': set(), 'tool_probe': set(),
                    'infer': {'model', 'reasoning'}, 'reconstruct': {'run_id'},
                    'mint': {'run_id', 'role', 'model', 'reasoning', 'expires_at', 'cap'},
                    'revoke': {'run_id'}}
@@ -282,6 +283,29 @@ class Controller:
             result = self.codex.read(self.auth.access())
             self.captured(run, 'admin.rate_limits.completed', result)
             return {'run_id': run, 'rate_limits': result}
+        if command == 'tool_probe':
+            key = self.keys.mint(run, 'acceptance', fc5.MODEL, fc5.EFFORT, time.time() + 300, 2)
+            try:
+                def infer(payload):
+                    delivered = []
+                    result = self.transport.responses(key, payload, lambda status, mime, body: delivered.append(status))
+                    if delivered != [200]:
+                        raise Refusal('inference_not_completed')
+                    return result
+
+                first = fc5.first_request()
+                response = infer(first)
+                tool = fc5.tool_result(response, strict_json, summary)
+                self.captured(run, 'tool.result', tool)
+                # Refuse loss/redaction of the first response before followup.
+                # The final replay below also verifies every retained byte/link.
+                self.reconstruct(run, _tool_prefix=True)
+                final = infer(fc5.next_request(first, response, tool))
+                fc5.final_response(final, summary)
+                self.captured(run, 'admin.tool_probe.completed', {'command': 'tool_probe', 'complete': True})
+                return {'run_id': run, 'reasoning': fc5.EFFORT, 'reconstruction': self.reconstruct(run)}
+            finally:
+                self.keys.revoke_run(run)
         if command == 'infer':
             key = self.keys.mint(run, 'acceptance', request['model'], request['reasoning'], time.time() + 300, 1)
             try:
@@ -299,7 +323,7 @@ class Controller:
                 self.keys.revoke_run(run)
         raise Refusal('invalid_request')
 
-    def reconstruct(self, run):
+    def reconstruct(self, run, *, _tool_prefix=False):
         """Re-read retained capture, not an in-memory successful response claim."""
         try:
             fd = os.open(self.transport.capture.root / (run + '.jsonl'), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -311,12 +335,15 @@ class Controller:
                 raw = f.read(128_000_001)
             if len(raw) > 128_000_000 or not raw.endswith(b'\n'):
                 raise ValueError()
-            calls = {}
-            completed = []
-            for line in raw.splitlines():
-                row = strict_json(line)
+            rows = [strict_json(line) for line in raw.splitlines()]
+            for row in rows:
                 if row['run_id'] != run or row['flags'] != [] or row['redactions'] != []:
                     raise ValueError()
+            if _tool_prefix or fc5.is_probe(rows):
+                return fc5.replay(rows, run, strict_json, summary, partial=_tool_prefix)
+            calls = {}
+            completed = []
+            for row in rows:
                 kind, data = row['kind'], row['data']
                 if kind == 'request.received':
                     call = data['call_id']

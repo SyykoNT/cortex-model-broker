@@ -71,7 +71,7 @@ have a five-second deadline per invocation; actual record scanning retains the
 
 **Scope choice:** the all-three requirement in the governing PRD §9.2 and A1.1
 is explicitly for **worker runs/model traffic**. Fixed, peer-checked operator
-acceptance (`models`, the bounded `infer`, `refresh`, `reconstruct`, optional
+acceptance (`models`, the bounded `infer` and `tool_probe`, `refresh`, `reconstruct`, optional
 `rate_limits`) is not worker traffic and needs actual **broker** capture, not
 invented proxy/orchestrator events. This separation breaks the acceptance startup
 cycle without relaxing the worker gate. An observed admin usage limit is captured
@@ -156,6 +156,7 @@ are accepted:
 | `status` | none | Metadata-only session projection: scopes, `client_id`, `ext_agent_host_id`, expiry, refresh count and `last_refresh_at`. No network/implicit refresh. No access, refresh or ID token. Historical sessions without a recorded refresh timestamp return null. Setup worker inference remains false. |
 | `models` | none | Existing `Transport.models`; only visible validated model slugs returned. No model availability fabricated. |
 | `infer` | `model`, `reasoning` | Exactly `gpt-6.1-sol` and `medium` or `high`; one call using a one-request internal acceptance key, fixed user text `Say exactly: Hello, world!`, no tools, `store:false`, `stream:true`. No fallback/retry. Key revoked in `finally`. |
+| `tool_probe` | none | Fixed FC5 operation: exactly two streamed `gpt-6.1-sol` high requests, one fixed harmless function, full context and one linked function output on the second request. No caller prompt, tools, model, reasoning, URL, path or budget. Returns only a closed replay summary, never arbitrary model text. |
 | `refresh` | none | Existing `Auth.access(force_refresh=True)`, under the shared bounded refresh lock. Returns metadata only; no caller token or path accepted. |
 | `reconstruct` | `run_id` | Bounded no-follow read of that run's retained JSONL, not caller-supplied paths; validates request/upstream association, exact model/effort, raw SSE against stored reconstruction, terminal completion and integer token usage. Refuses incomplete, changed, redacted or flagged records. |
 | `rate_limits` | none | Optional documented Codex app-server integration below. No quota inferred from ordinary API errors. |
@@ -173,6 +174,67 @@ capture-write failure cannot be presented as a successful reconstruction.
 This checks consistency, **not cryptographic archive authenticity** against a
 malicious service owner who can rewrite every copy. Trace export remains a
 separate deployment prerequisite.
+
+## Fixed tool-bearing FC5 operation
+
+The exact packet is `{"version":1,"command":"tool_probe"}`. Existing infer,
+status, refresh and client attempt semantics are unchanged. The fixed function
+`functions.fc5_fixed_marker` accepts only `{"probe":"fc5"}` (strict closed
+object schema, required singleton-enum string) and returns exactly the JSON string
+`{"marker":"fc5-fixed-ok"}`. It performs no I/O, shell, URL fetch or general tool
+dispatch. The model must issue exactly one completed `function_call` with that
+name/namespace and arguments; missing, extra, malformed or other calls fail.
+First request uses `tool_choice:"required"`, second `"none"`, both disable
+parallel calls and use `store:false`, `stream:true`. Existing adaptation groups
+the fixed function into the `functions` namespace. Both requests include
+`reasoning.encrypted_content`; all first-response output items are copied into
+the second full `input`, followed by the literal `function_call_output` bearing
+the exact model-returned `call_id`. The final assistant message must be `FC5_OK`.
+
+The broker mints only an internal acceptance key with cap two, revokes it in
+`finally`, and never retries. It uses the existing Transport, actual scanner and
+Capture. It reads back and validates the first capture plus `tool.result` before
+the second request, and the complete retained run before reporting success.
+Both responses require exact model, explicit high reasoning echo, final completion,
+valid integer usage and streamed item/argument identities consistent with terminal
+output. Model incompatibility is a refusal, never model or effort substitution.
+
+Cold reconstruction validates an exact ordered nine-record sequence, two unique
+transport call IDs, acceptance admission/cap/used fields, fixed request bytes as
+JSON values, exact adaptations, original SSE bytes/count/classification/reparsed
+data, model function call, constant local result and identical full-input
+correspondence. A deleted opening marker does not downgrade a tool transcript
+to legacy tool-less replay. Summary fields are `run_id`, `verified_calls:2`,
+`calls` (per-request model/effort/terminal/usage), `tool` (fixed name, arguments,
+output and validated model call ID) and `final_text:"FC5_OK"`. The operation
+wraps this as `{run_id, reasoning:"high", reconstruction}`. Raw transcripts
+remain in broker capture; the admin reply cannot export arbitrary model text.
+This proves consistency against the fixed contract, not cryptographic authenticity
+against a broker owner capable of replacing every transcript.
+
+Live FC5 has not been established by offline fixtures. A later actual fixed run
+can establish tool-bearing broker-log reconstruction on this route; it does not
+claim a full Hermes worker/session export, proxy/orchestrator integration or
+enable workers. The separate listener/admission remains OFF.
+
+### Secret-safe scanner diagnostics (not recovery)
+
+Gitleaks reports are requested as JSON on stdout, read only through bounded pipes
+and memory (4 MB, 30 seconds, at most 4096 findings), never saved or printed.
+Successful no-match captures keep their existing schema and values. On a detected
+match, the entire value is still replaced by `redacted_body:"gitleaks-match"`,
+with `flags:["secret"]` and a `gitleaks` redaction. Only `scanner_diagnostics`
+is added: version, total finding count, rule IDs, per-rule counts and numeric
+start/end line/column locations. Locations refer to the scanner's JSON input
+after pre-redaction, not necessarily the original SSE body. No Secret, Match,
+context, path, value or complete raw report may be retained or returned.
+
+Missing, malformed, inconsistent, oversized or timed-out reports are scanner
+failures, not accepted redactions; no success is synthesized. No scanner
+exclusions, allowlists or disabled detection were added. Diagnostics do **not**
+make redacted captures reconstructable and cannot retroactively recover a prior
+discarded raw body/header. A match alone does not establish a true secret or a
+false positive. Reconstruction continues to reject every flagged/redacted row.
 
 ## D1: documented Codex app-server quota read
 

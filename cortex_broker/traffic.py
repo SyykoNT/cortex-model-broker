@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
 import stat
 import threading
 import time
@@ -15,6 +14,7 @@ import uuid
 
 from .auth import HTTP, bounded_body
 from .protocol import Refusal, adapt, classify_response
+from .scanner_diagnostics import scan
 
 
 class Capture:
@@ -64,16 +64,11 @@ class Capture:
             return obj
         cleaned = clean(value)
         encoded = json.dumps(cleaned, ensure_ascii=True).encode()
-        result = subprocess.run([self.scanner, 'stdin', '--redact', '--no-banner', '--log-level', 'error'],
-                                input=encoded, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                timeout=30, cwd=self.root,
-                                env={'PATH': '/usr/bin:/bin', 'HOME': str(self.root)})
-        if result.returncode == 1:
+        diagnostics = scan(self.scanner, encoded, self.root)
+        if diagnostics is not None:
             # Never put a detected secret in an artifact, including a scanner report.
-            cleaned = {'redacted_body': 'gitleaks-match'}
+            cleaned = {'redacted_body': 'gitleaks-match', 'scanner_diagnostics': diagnostics}
             redactions.append('gitleaks')
-        elif result.returncode != 0:
-            raise Refusal('redaction_scanner_unavailable')
         return cleaned, redactions
 
     def append(self, run_id, kind, value):
