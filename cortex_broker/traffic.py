@@ -14,7 +14,7 @@ import urllib.request
 import uuid
 
 from .auth import HTTP, bounded_body
-from .protocol import Refusal, adapt, reconstruct_sse
+from .protocol import Refusal, adapt, classify_response
 
 
 class Capture:
@@ -157,6 +157,7 @@ class Transport:
         chunks = []
         size = 0
         status = None
+        content_type = None
         try:
             try:
                 response = self.opener.open(upstream, timeout=120)
@@ -164,6 +165,7 @@ class Transport:
                 response = error
             with response:
                 status = response.status
+                content_type = response.headers.get('Content-Type')
                 while True:
                     if time.monotonic() >= deadline:
                         raise Refusal('provider_deadline')
@@ -174,19 +176,20 @@ class Transport:
                     if size > 64_000_000:
                         raise Refusal('response_capture_limit')
                     chunks.append(chunk)
-                content_type = response.headers.get('Content-Type', 'application/octet-stream')
             body = b''.join(chunks)
             text = body.decode('utf-8')
-            reconstructed = reconstruct_sse(text) if 'text/event-stream' in content_type else {'complete': False, 'terminal': 'http-error'}
+            reconstructed, classification = classify_response(status, content_type, text)
             self.capture.append(run, 'response', {'call_id': call_id, 'status': status,
-                'body': text, 'reconstructed': reconstructed, 'bytes': size})
+                'body': text, 'reconstructed': reconstructed, 'bytes': size,
+                'classification': classification})
             if status == 429 or any(s in text for s in ['subscription_sharing_usage_limit_exceeded', 'subscription_sharing_usage_unavailable']):
                 self.on_limit(run, {'call_id': call_id, 'status': status})
             # Buffer through the terminal event so redaction sees secrets split over
             # SSE chunks. The consumer receives the unmodified provider SSE bytes.
-            emit(status, content_type, body)
+            emit(status, content_type if content_type is not None else 'application/octet-stream', body)
             return reconstructed
         except Exception:
             self.capture.append(run, 'response.interrupted', {'call_id': call_id, 'status': status,
-                'body': b''.join(chunks).decode('utf-8', errors='replace'), 'bytes': size})
+                'body': b''.join(chunks).decode('utf-8', errors='replace'), 'bytes': size,
+                'classification': {'version': 1, 'content_type': content_type, 'decision': 'interrupted'}})
             raise Refusal('provider_or_capture_failure') from None

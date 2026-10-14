@@ -116,13 +116,113 @@ class RunKeys:
 
 
 def reconstruct_sse(body):
+    """Validate the entire Responses SSE envelope, not just selected data lines.
+
+    A MIME hint cannot authorize completion. Reject malformed/unterminated frames,
+    ambiguous JSON and conflicting event identities even for canonical headers.
+    Keep all parsed events and the caller's original body for capture/replay.
+    """
     events = []
-    for block in body.replace("\r\n", "\n").split("\n\n"):
-        data = "\n".join(line[5:].lstrip(" ") for line in block.splitlines() if line.startswith("data:"))
-        if data and data != "[DONE]":
-            events.append(json.loads(data))
-    completed = [e for e in events if e.get("type") == "response.completed"]
-    failures = [e for e in events if e.get("type") in {"response.failed", "response.incomplete", "error"}]
-    return {"events": events, "response": completed[-1].get("response") if completed else None,
-            "complete": len(completed) == 1 and not failures and events[-1] is completed[0],
-            "terminal": failures[-1].get("type") if failures else ("response.completed" if completed else "interrupted")}
+    valid, done = True, False
+    response_ids = set()
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('duplicate field')
+            result[key] = value
+        return result
+
+    def constant(_):
+        raise ValueError('nonfinite number')
+
+    # SSE permits CRLF, CR, LF and an initial UTF-8 BOM. Never rewrite capture.
+    normalized = body.removeprefix('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
+    blocks = normalized.split('\n\n')
+    try:
+        # EOF does not dispatch an unfinished frame, including a complete JSON
+        # object without its blank-line delimiter.
+        if blocks[-1].strip('\n'):
+            raise ValueError('unterminated frame')
+        for block in blocks[:-1]:
+            data, name = [], None
+            for line in block.split('\n'):
+                if not line or line.startswith(':'):
+                    continue
+                field, separator, value = line.partition(':')
+                if value.startswith(' '):
+                    value = value[1:]
+                if not separator or field not in {'data', 'event', 'id', 'retry'}:
+                    raise ValueError('invalid SSE field')
+                if field == 'data':
+                    data.append(value)
+                elif field == 'event':
+                    if name is not None:
+                        raise ValueError('duplicate event name')
+                    name = value
+                elif field == 'id' and '\x00' in value:
+                    raise ValueError('invalid event id')
+                elif field == 'retry' and (not value.isascii() or not value.isdigit()):
+                    raise ValueError('invalid retry')
+            if not data:
+                if name is not None:
+                    raise ValueError('event without data')
+                continue
+            if done:
+                raise ValueError('data after DONE')
+            raw = '\n'.join(data)
+            if raw == '[DONE]':
+                if name is not None or not events or events[-1]['type'] not in {
+                        'response.completed', 'response.failed', 'response.incomplete', 'error'}:
+                    raise ValueError('premature DONE')
+                done = True
+                continue
+            event = json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+            if (not isinstance(event, dict) or not isinstance(event.get('type'), str)
+                    or not (event['type'].startswith('response.') or event['type'] == 'error')
+                    or (name is not None and name != event['type'])):
+                raise ValueError('invalid or conflicting event type')
+            response = event.get('response')
+            if isinstance(response, dict) and 'id' in response:
+                if not isinstance(response['id'], str) or not response['id']:
+                    raise ValueError('invalid response id')
+                response_ids.add(response['id'])
+                if len(response_ids) > 1:
+                    raise ValueError('conflicting response ids')
+            if event['type'] == 'response.completed' and (
+                    not isinstance(response, dict)
+                    or response.get('status', 'completed') != 'completed'
+                    or response.get('error') is not None
+                    or response.get('incomplete_details') is not None):
+                raise ValueError('conflicting completion')
+            events.append(event)
+    except (ValueError, TypeError, RecursionError):
+        valid = False
+    completed = [e for e in events if e.get('type') == 'response.completed']
+    failures = [e for e in events if e.get('type') in {'response.failed', 'response.incomplete', 'error'}]
+    return {'events': events, 'response': completed[-1].get('response') if completed else None,
+            'complete': valid and len(completed) == 1 and not failures and events[-1] is completed[0],
+            'terminal': ('invalid-sse' if not valid else failures[-1]['type'] if failures
+                         else 'response.completed' if completed else 'interrupted')}
+
+
+def classify_response(status, content_type, body):
+    """One transport/replay decision; header observation is never synthesized.
+
+    Only this single noncredential header enters Capture.safe, not a header map.
+    A missing header remains None; normalization is separate from observation.
+    """
+    media_type = content_type.split(';', 1)[0].strip().lower() if content_type is not None else None
+    reconstructed = reconstruct_sse(body)
+    if status != 200:
+        reconstructed = {**reconstructed, 'complete': False, 'terminal': 'http-error'}
+        decision = 'http-status-rejected'
+    elif reconstructed['terminal'] == 'invalid-sse' or not reconstructed['events']:
+        decision = 'invalid-sse'
+    else:
+        decision = 'sse-header' if media_type == 'text/event-stream' else 'sse-body'
+    return reconstructed, {'version': 1, 'content_type': content_type,
+                           'media_type': media_type, 'decision': decision,
+                           'notes': ['content_type_mismatch'] if reconstructed['complete']
+                           and media_type != 'text/event-stream' else []}
