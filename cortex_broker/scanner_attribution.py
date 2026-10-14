@@ -117,7 +117,7 @@ def response_shape(encoded):
     return shape
 
 
-def build_spans(encoded, *, shape=None):
+def build_spans(encoded, *, shape=None, coverage_only=False):
     """Return nonoverlapping positions + static labels, never source strings."""
     if type(encoded) is not bytes or len(encoded) > MAX_INPUT or not encoded.isascii() or b'\n' in encoded or b'\r' in encoded:
         raise ValueError()
@@ -180,6 +180,10 @@ def build_spans(encoded, *, shape=None):
             elif state == 'response':
                 if key == 'id':
                     cls = 'response_id'
+                elif coverage_only and key == 'prompt_cache_key':
+                    # Diagnostic-only known scalar, NEVER strict field evidence
+                    # or an opaque class. No arbitrary response key is admitted.
+                    cls = 'response_metadata'
                 elif key == 'output':
                     next_state = 'item[]'
             elif state == 'item':
@@ -378,6 +382,102 @@ def build_spans(encoded, *, shape=None):
     if any(a[1] > b[0] for a, b in zip(spans, spans[1:])):
         raise ValueError()
     return spans
+
+
+# Separate budgets: coverage must neither consume proof work nor affect evidence.
+MAX_COVERAGE_WORK = 64_000_000
+MAX_COVERAGE_OCCURRENCES = 4096
+MAX_COVERAGE_VISITS = 65_536
+MAX_COVERAGE_GROUPS = 256
+MAX_COVERAGE_LABELS = 4096
+
+
+def structural_coverage(encoded, transient):
+    """NON-AUTHORITATIVE overlaps of every exact complete-Match occurrence.
+
+    Reuse ONLY admitted static spans; never parse Secret or export dynamic keys.
+    Internal location identities associate within this secondary report only.
+    The public projection sorts these descriptors and exports no identifiers,
+    offsets or report order. Coverage never supplies or relaxes a field proof.
+    """
+    def empty(status):
+        return dict(status=status, occurrences=[])
+
+    results = {id(loc): empty('input_unsupported') for loc, _, _ in transient}
+    if type(encoded) is not bytes:
+        return results
+    if len(encoded) > MAX_INPUT:
+        return {key: empty('input_budget') for key in results}
+    try:
+        spans = build_spans(encoded, coverage_only=True)
+    except Exception:
+        return {key: empty('structure_unsupported_or_budget') for key in results}
+    # build_spans verifies disjoint member intervals. Value ends are therefore
+    # sorted too, permitting interval lookup without rescanning all spans.
+    value_ends = [s[3] for s in spans]
+    work, occurrences = MAX_COVERAGE_WORK, MAX_COVERAGE_OCCURRENCES
+    visits, group_budget, label_budget = MAX_COVERAGE_VISITS, MAX_COVERAGE_GROUPS, MAX_COVERAGE_LABELS
+    for location, match, supported in transient:
+        if not supported:
+            results[id(location)] = empty('tags_unsupported')
+            continue
+        if (type(match) is not str or not match or not match.isascii() or
+                location['start_line'] != 1 or location['end_line'] != 1 or
+                len(match) != location['end_column'] - location['start_column'] + 1):
+            results[id(location)] = empty('match_unsupported')
+            continue
+        needle, cursor, groups = match.encode('ascii'), 0, {}
+        status = 'match_absent'
+        while True:
+            cost = len(encoded) - cursor + len(needle)
+            if cost > work:
+                status = 'search_budget'
+                break
+            work -= cost
+            start = encoded.find(needle, cursor)
+            if start < 0:
+                status = 'complete' if groups else 'match_absent'
+                break
+            if occurrences <= 0:
+                status = 'occurrence_budget'
+                break
+            occurrences -= 1
+            end = start + len(needle)
+            labels, relation = set(), 'no_known_overlap'
+            i = bisect_right(value_ends, start)
+            while i < len(spans) and spans[i][2] < end:
+                if visits <= 0:
+                    status = 'overlap_budget'
+                    break
+                visits -= 1
+                left, right, value_start, value_end, path, cls = spans[i]
+                if value_start < value_end and start < value_end and end > value_start:
+                    labels.add((path, cls))
+                    relation = ('inside_value' if value_start <= start < end <= value_end else
+                                'inside_member' if left <= start < end <= right else
+                                'crosses_member_boundary')
+                i += 1
+            if status == 'overlap_budget':
+                break
+            key = (relation, tuple(sorted(labels)))
+            if key not in groups:
+                if group_budget <= 0 or len(labels) > label_budget:
+                    status = 'output_budget'
+                    break
+                group_budget -= 1
+                label_budget -= len(labels)
+                groups[key] = 0
+            groups[key] += 1
+            cursor = start + 1  # ALL occurrences, including overlaps and unknowns.
+        # No partial groups/counts can look like exhaustive coverage. Earlier
+        # complete findings survive; consumed budget is never refunded.
+        result = empty(status)
+        if status == 'complete':
+            result['occurrences'] = [dict(relation=relation, count=count,
+                overlaps=[dict(field_path=path, field_class=cls) for path, cls in labels])
+                for (relation, labels), count in sorted(groups.items())]
+        results[id(location)] = result
+    return results
 
 
 def attribute(summary, encoded, transient):

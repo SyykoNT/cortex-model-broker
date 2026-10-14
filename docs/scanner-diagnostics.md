@@ -2,11 +2,12 @@
 
 ## Safety contract
 
-Schema version 5 retains PRIMARY rule IDs, counts and numeric scanner locations. Each
+Schema version 6 retains PRIMARY rule IDs, counts and numeric scanner locations. Each
 location adds `field_path: "unknown"`, `field_class: "unknown"`, a static
 `attribution_reason`, and `coordinate_space: "scanner_local"`. Known field labels
-appear only in independent secondary `rules[].field_evidence`, never on primary
-locations. The top-level `encoded_byte_count` records
+are proved only in independent secondary `rules[].field_evidence`, never on primary
+locations. Separate `rules[].structural_coverage` labels are NON-AUTHORITATIVE
+overlap observations, not proofs or exceptions. The top-level `encoded_byte_count` records
 the exact scanner input length (null only when the projector has no byte input).
 Labels describe supported syntax, **not authenticated provider provenance or
 credential safety**. No field exceptions, entropy exemptions, partial redaction,
@@ -164,6 +165,124 @@ Secondary failures publish no `field_evidence`; reasons include `secondary_clean
 `secondary_invalid_report`, `secondary_mismatch`, and `secondary_unavailable`.
 Other association reasons are `primary_unsupported_tags` and the internal initial
 `secondary_not_run` label. Ordinary proof reasons below remain unchanged.
+
+## Non-authoritative structural coverage (version 6)
+
+The strict proof above is unchanged. A complete Match can overlap a known value
+without fitting its member, or occur wholly in an unindexed field. Those cases
+still yield `occurrence_outside_field` in `field_evidence`. A separate sideband
+now distinguishes them without recovering primary or historical field identity.
+
+After the same secondary rule/count admission, each rule may include:
+
+```json
+{
+  "structural_coverage": {
+    "authority": "non_authoritative",
+    "scope": "secondary_complete_match_occurrences",
+    "findings": [{
+      "status": "complete",
+      "occurrences": [{
+        "relation": "crosses_member_boundary",
+        "count": 1,
+        "overlaps": [{"field_path": "request.instructions", "field_class": "request_content"}]
+      }]
+    }]
+  }
+}
+```
+
+One descriptor is retained for every SECONDARY finding, sorted by its sanitized
+projection, not scanner order. It carries no index, finding ID, coordinates, Match,
+Secret, matched text or dynamic key. **Never zip these descriptors to primary
+locations.** Identical descriptors may repeat. Each complete descriptor aggregates
+ALL exact overlapping occurrences of that finding's entire Match in the original
+encoded bytes by relation and the sorted set of static path/class pairs. Counts
+are occurrence multiplicities, NOT primary findings, unique secret counts or field
+proofs; duplicates across findings must not be summed as unique occurrences.
+
+Coverage uses the existing schema/discriminator-admitted string-value intervals,
+plus ONE diagnostic-only whitelist entry: `prompt_cache_key` immediately under a
+known response object, class `response_metadata`. Its prefixes are exactly
+`reconstructed.response`, `reconstructed.events[].response`, `body.json`, and
+`body.sse[].response`. This is neither an opaque class nor strict field evidence.
+The default proof/shape parser calls do not enable this entry. Arbitrary sibling
+keys, nested metadata, and the same key under output parts stay unclassified.
+
+Relations are:
+
+- `inside_value`: the whole occurrence fits a nonempty admitted value interval.
+- `inside_member`: it fits the admitted member (including key/assignment/closing
+  delimiter), overlaps the value, but does not fit entirely inside the value.
+- `crosses_member_boundary`: it overlaps nonempty admitted value content but extends
+  beyond that member; all intersecting known values are reported, including output
+  text and request content, even alongside encrypted reasoning.
+- `no_known_overlap`: no admitted nonempty value overlaps. This does NOT imply
+  opaque/safe content or even a successfully parsed field; unknown keys/types,
+  key-only matches, malformed bodies, unsupported SSE segments and empty values
+  remain unclassified. No unknown-key spelling or structural ancestor is exported.
+
+The status whitelist is `complete`, `match_absent`, `input_unsupported`,
+`input_budget`, `structure_unsupported_or_budget`, `match_unsupported`,
+`tags_unsupported`, `search_budget`, `occurrence_budget`, `overlap_budget`,
+`output_budget`, and `coverage_failure`. Any incomplete finding has an empty
+`occurrences` list, never partial counts. Earlier complete descriptors can survive
+later budget exhaustion. Failed/mismatched secondary scans publish no sideband.
+
+Coverage reuses the unchanged bounded parsing grammar and a closed static field vocabulary. It has
+SEPARATE report-wide budgets: 64,000,000 charged search bytes, 4,096 occurrences,
+65,536 interval visits, 256 distinct aggregate groups (summed over findings), and
+4,096 emitted path/class pairs. At most 4,096 finding descriptors are admitted by
+the existing report validator. Input, body, node and depth caps remain unchanged.
+No budget is refunded after a failed finding. Coverage failure cannot change
+strict `field_evidence`, the primary result, whole-value redaction or refusal.
+
+### Pinned generic rule: demonstrated, not a historical diagnosis
+
+Gitleaks v8.30.1 `config/gitleaks.toml:638-641` defines `generic-api-key` with a
+keyword prefix, an assignment operator **including comma**, a captured candidate
+and a trailing delimiter. Its entropy threshold is 3.5. In `detect/detect.go`,
+lines 478-498 assign locations and `Match` from the full regex match; lines
+521-544 replace `Secret` with the capture group and compute entropy on **Secret**,
+not Match. Thus the candidate and the complete expression need not occupy the
+same structural field. Sources:
+
+- https://github.com/gitleaks/gitleaks/blob/v8.30.1/config/gitleaks.toml#L638-L641
+- https://github.com/gitleaks/gitleaks/blob/v8.30.1/detect/detect.go#L478-L544
+
+Synthetic actual-binary regression: set request `instructions` to `access_token`
+and give the following sibling a deliberately synthetic high-entropy key, produced
+by concatenating `Ab3cD4eF5gH6iJ7k` and `L8mN9pQ0rS1tU2vW`. The default JSON
+serializer places quote/comma/space/quote between them. The real rule returns a
+complete Match starting in `instructions` and ending in the following **key**;
+Secret is just that key. The strict proof stays unknown; coverage says request
+content / `crosses_member_boundary`. The same construction after output `text`
+reports `output_text`, never an opaque class. These are intentionally synthetic
+boundary examples, not assertions about the discarded production body.
+
+Other real-binary fixtures detect an `api_key=` assignment inside Responses IDs
+and encrypted reasoning (direct, JSON body, and SSE), and inside an unsupported
+metadata field of a valid SSE envelope. The first cases give `inside_value`; the
+last gives `no_known_overlap`. Mixed output/encrypted complete occurrences retain
+both classes while strict proof remains unknown. **Secret is never substituted
+for Match**, and overlap labels must never become exemption evidence.
+
+The retained HTTP-200/SSE receipt rules out the earlier size-cap and HTTP-error
+explanations for that attempt, but does not identify its missing fields. No raw
+body was retained. These synthetic mechanisms explain the diagnostic ambiguity;
+they cannot determine which mechanism produced any historical finding.
+
+A stronger unindexed-field reproduction uses a synthetic UUID-valued response
+`prompt_cache_key`, repeated in a final response and three reconstructed response
+events. The pinned binary actually emits **four generic-api-key findings with
+57-byte complete Matches and 36-byte captured Secrets**, while strict field
+evidence stays `occurrence_outside_field`. Coverage independently reports
+`response_metadata` / `inside_member`; it does NOT upgrade field evidence.
+This reproduces the retained receipt's rule/count/width signature without its
+body or values, and is a compatible mechanism, **not identification of the
+historical field**. The request-side key was already admitted as request content;
+the response-side key was not indexed by the strict proof. The candidate adds
+only the response-side coverage entry, not proof admission or any exemption.
 
 ## Diagnostic budgets
 

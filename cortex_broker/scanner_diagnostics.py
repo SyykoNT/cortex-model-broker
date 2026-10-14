@@ -11,7 +11,7 @@ import subprocess
 import time
 
 from .protocol import Refusal
-from .scanner_attribution import attribute, response_shape
+from .scanner_attribution import attribute, response_shape, structural_coverage
 
 MAX_REPORT = 4_000_000
 MAX_FINDINGS = 4096
@@ -149,7 +149,7 @@ def _project(status, raw, encoded, content):
                                 coordinate_space='scanner_local', attribution_reason=(
                                     'secondary_not_run' if finding.get('Tags') == []
                                     else 'primary_unsupported_tags'))
-        summary = {'version': 5, 'finding_count': len(report), 'rules': [
+        summary = {'version': 6, 'finding_count': len(report), 'rules': [
             {'rule_id': rule, 'count': len(locations), 'locations': locations}
             for rule, locations in sorted(rules.items())]}
         # Discard every other raw finding field before content verification.
@@ -165,6 +165,16 @@ def _project(status, raw, encoded, content):
             for location, _, _ in transient:
                 location.update(field_path='unknown', field_class='unknown',
                                 coordinate_space='scanner_local', attribution_reason='attribution_failure')
+        try:
+            coverage = structural_coverage(encoded, transient)
+        except Exception:
+            # Coverage failure cannot erase or promote strict field evidence.
+            coverage = {id(loc): dict(status='coverage_failure', occurrences=[])
+                        for loc, _, _ in transient}
+        for rule in summary['rules']:
+            rule['structural_coverage'] = dict(
+                authority='non_authoritative', scope='secondary_complete_match_occurrences',
+                findings=sorted((coverage[id(loc)] for loc in rule['locations']), key=json.dumps))
         transient.clear()
         return summary
     except Exception:
@@ -232,6 +242,7 @@ def _enrich(primary, scanner, encoded, root):
                            for loc in evidence_by_rule[rule['rule_id']]['locations']})
         rule['field_evidence'] = [dict(field_path=path, field_class=cls, attribution_reason=why)
                                   for path, cls, why in evidence]
+        rule['structural_coverage'] = evidence_by_rule[rule['rule_id']]['structural_coverage']
         for loc in rule['locations']:
             if loc['attribution_reason'] != 'primary_unsupported_tags':
                 loc['attribution_reason'] = 'secondary_evidence_unlinked'
