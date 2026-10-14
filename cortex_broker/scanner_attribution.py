@@ -106,7 +106,18 @@ def literal(node, key):
     return child.value if child is not None and child.kind == 'string' else None
 
 
-def build_spans(encoded):
+def response_shape(encoded):
+    """Bounded structural observation only; no capture-kind/provenance claim."""
+    shape = dict(http_status=None, body_format='unknown', classification_decision='unknown')
+    try:
+        build_spans(encoded, shape=shape)
+    except Exception:
+        # No private parse exception, source keys or values leave this boundary.
+        pass
+    return shape
+
+
+def build_spans(encoded, *, shape=None):
     """Return nonoverlapping positions + static labels, never source strings."""
     if type(encoded) is not bytes or len(encoded) > MAX_INPUT or not encoded.isascii() or b'\n' in encoded or b'\r' in encoded:
         raise ValueError()
@@ -114,6 +125,14 @@ def build_spans(encoded):
     parser = Parser(len(encoded))
     root = parser.parse(text)
     spans = []
+    if shape is not None and root.kind == 'object':
+        status = root.children.get('status')
+        if status is not None and type(status.value) is int and 100 <= status.value <= 599:
+            shape['http_status'] = status.value
+        classification = root.children.get('classification')
+        decision = literal(classification, 'decision') if classification is not None else None
+        if decision in {'http-status-rejected', 'invalid-sse', 'sse-header', 'sse-body'}:
+            shape['classification_decision'] = decision
 
     def add(node, path, cls, mapping):
         if node.kind != 'string':
@@ -229,11 +248,49 @@ def build_spans(encoded):
         if offsets[-1] != node.end - 1:
             return
         initial = len(spans)
+
+        def format_is(label):
+            if shape is not None:
+                shape['body_format'] = label
+
+        def fallback():
+            # Never cover admitted deeper spans. This is NOT an opaque/model
+            # output label, a safety claim or an exemption-eligible class.
+            if len(spans) == initial:
+                add(node, 'body', 'unclassified_response_body', lambda *p: p)
+
+        stripped = body.strip()
+        inspected = stripped.removeprefix('\ufeff').lstrip()
+        if not stripped:
+            format_is('empty')
+            return
         try:
-            if body.lstrip().startswith('{'):
+            if inspected and (inspected[0] in '{["-0123456789' or inspected in {'null', 'true', 'false'}):
                 parsed = parser.parse(body)
+                format_is('json')
                 if literal(parsed, 'object') == 'response':
+                    # Even a known envelope with no admitted fields must not
+                    # acquire a broad fallback over malformed/unsupported fields.
                     walk(parsed, 'response', 'body.json', lambda *p: tuple(offsets[i] for i in p))
+                elif (parsed.kind != 'object' or
+                      (not {'object', 'output'} & parsed.children.keys() and
+                       literal(parsed, 'type') not in EVENTS)):
+                    # Reserved envelope keys with bad/missing discriminators
+                    # are not evidence that the body is an unrelated schema.
+                    fallback()
+                return
+            # Markup is a lexical shape hint, not validated HTML or a cause.
+            if stripped.startswith('<'):
+                format_is('markup')
+                fallback()
+                return
+            # Inspect the bounded whole body, not just the first line, so bad
+            # framing before a known SSE field cannot become plain fallback.
+            if not re.search(r'(?:^|[\r\n])[ \t]*(?:\ufeff)?(?:data|event|id|retry)(?=:|[ \t\r\n]|$)|(?:^|[\r\n])[ \t]*(?:\ufeff)?:', body):
+                if any(ord(char) < 32 and char not in '\t\r\n' for char in body):
+                    return
+                format_is('plain')
+                fallback()
                 return
             frames = []
             data, name = [], None
@@ -306,8 +363,15 @@ def build_spans(encoded):
                     return tuple(offsets[origin + p - start] for p in points)
 
                 walk(parsed, 'event', 'body.sse[]', mapping)
+            if frames:
+                format_is('sse')
+                if not any(literal(parsed, 'type') in EVENTS for parsed, _ in frames):
+                    fallback()
         except (ValueError, TypeError, IndexError, RecursionError, OverflowError):
             del spans[initial:]
+            format_is('unknown')
+            # Parse ambiguity, malformed known schemas and budgets never become
+            # broad body evidence. Leave these occurrences unknown.
 
     walk(root, 'root', '', lambda *points: points)
     spans.sort()

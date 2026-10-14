@@ -2,7 +2,7 @@
 
 ## Safety contract
 
-Schema version 4 retains PRIMARY rule IDs, counts and numeric scanner locations. Each
+Schema version 5 retains PRIMARY rule IDs, counts and numeric scanner locations. Each
 location adds `field_path: "unknown"`, `field_class: "unknown"`, a static
 `attribution_reason`, and `coordinate_space: "scanner_local"`. Known field labels
 appear only in independent secondary `rules[].field_evidence`, never on primary
@@ -16,6 +16,56 @@ Every detection still discards the ENTIRE captured value, adds `gitleaks` /
 `secret`, and preserves existing reconstruction refusal. Clean scans return the
 existing cleaned value and do not run attribution. Malformed, oversized, timed
 out or failed primary scanner reports retain `redaction_scanner_unavailable`.
+
+## Response shape (structural only)
+
+After a validated primary detection, the optional metadata path adds
+`response_shape`, independently of whether the secondary scanner succeeds. It
+contains **only** these keys:
+
+| Key | Allowed values / source |
+| --- | --- |
+| `http_status` | Exact JSON integer `status` in 100..599, otherwise null; booleans, strings and floats are rejected. |
+| `body_format` | `json`, `sse`, `markup`, `plain`, `empty`, or `unknown`; bounded inspection of the root string `body`. |
+| `classification_decision` | Root `classification.decision` equal to `http-status-rejected`, `invalid-sse`, `sse-header`, or `sse-body` (the protocol's existing decisions), otherwise `unknown`. |
+
+These are observed shapes, **not authenticated HTTP/provider provenance**: capture
+kind is not passed to this path and a model-controlled object could have the same
+structure. No status is inferred from body content; no classification is recomputed
+for authority. No raw body, dynamic key, content type, error string or error code
+is retained. No error-code whitelist is needed.
+
+`json` requires a complete duplicate-free parse (including scalar/array JSON).
+`sse` requires the existing complete framing/parser checks and at least one parsed
+frame, not successful completion or a 200 status. Known JSON/SSE envelopes with
+unsupported fields can still have a structural format without field attribution.
+`markup` means only a whitespace-trimmed leading `<`, not validated HTML or an
+explanation of its source. `plain` means nonempty text with no JSON-looking prefix,
+SSE-looking line or disallowed low control character. Whitespace-only strings are
+`empty`. Unsupported types, malformed JSON/SSE, duplicates and exhausted parsing
+budgets remain `unknown`; nothing guesses a production root cause.
+
+The shape projector reuses the same bounded syntax inspector as attribution: at
+most one additional input/body parse per detected capture, with the unchanged
+4,000,000 input/body cap, node cap and depth limit. Its budget is independent of
+the secondary proof's existing budget. No scan bytes or scanner/report/time/search
+limits change. Root parse failure returns all unknown/null; body failure may retain
+independently validated status/decision. A shape exception is contained without
+preventing secondary evidence; an unexpected outer optional aggregation failure
+may omit `response_shape`. Clean/failed primary scans never start shape inspection.
+
+### Complete public summary key inventory
+
+- `version`: 5; `finding_count`: validated primary count;
+  `encoded_byte_count`: exact whole scanner input length or null.
+- `rules[]`: `rule_id`, primary `count`, primary `locations`, and optional independent
+  secondary `field_evidence` (no identity join or per-field counts).
+- `locations[]`: `start_line`, `end_line`, `start_column`, `end_column` (primary
+  numeric coordinates), `coordinate_space` (`scanner_local`), `field_path` and
+  `field_class` (always `unknown` in scan results), `attribution_reason`.
+- `field_evidence[]`: only static `field_path`, `field_class`, `attribution_reason`.
+- Optional `response_shape`: only the three keys in the table above; not linked
+  to any finding. The lower-level `project` helper does not compute shape.
 
 ## Private report transport
 
@@ -133,13 +183,14 @@ Safe reasons are `exact_all_occurrences`, `input_unsupported`, `input_budget`,
 `structure_unsupported_or_budget`, `match_unsupported`, `tags_unsupported`,
 `match_absent`, `occurrence_outside_field`, `occurrence_ambiguous`, `search_budget`,
 `occurrence_budget`, and `attribution_failure`. Structural failure within an
-individual body simply leaves its spans unavailable (`occurrence_outside_field`).
+individual JSON/SSE body simply leaves its spans unavailable (`occurrence_outside_field`); it never triggers a parse-failure fallback.
 Counts and reasons do not disclose source snippets or arbitrary strings.
 
 ## Supported static labels
 
 | Field path | Field class |
 | --- | --- |
+| `body` | `unclassified_response_body` (conservative fallback only; never opaque or exemption-eligible) |
 | `request.instructions`, `request.input[].content`, `request.input[].output` | `request_content` |
 | `request.input[].id`, `request.input[].call_id` | `request_identifier` |
 | `body.sse[].response.id`, `reconstructed.response.id` | `response_id` |
@@ -150,8 +201,22 @@ Counts and reasons do not disclose source snippets or arbitrary strings.
 | `body.sse[].delta` | `output_text`, `reasoning_text`, `function_arguments` (whitelisted event type) |
 | `body.sse[].item_id` | `output_item_reference` |
 
+The `body` fallback is admitted only for bounded plain/markup bodies, valid JSON
+without known/reserved response envelope keys (`object`, `output`, or a known event
+`type`), or fully parsed SSE with no known event schema,
+and only when that body has **zero** admitted deeper spans. It covers the outer
+body string's member/value interval, never overlaps/replaces a known span, and
+never supplies fallback for unknown siblings of a known output field. Known
+response/event envelopes with no admitted spans remain unknown (including malformed
+known field types); malformed/duplicate JSON, framing errors, and budget failures
+never become fallback evidence. Empty values cannot prove value overlap. All tags,
+all-occurrence agreement, ambiguity and search-budget checks remain unchanged.
+This class means only an unclassified response-shaped body, not opaque provider
+metadata, safe content, or exemption eligibility. Unsupported outer metadata stays
+unknown, distinguishing it from proven occurrences in an unparsed body.
+
 Equivalent response/item paths are supported under `reconstructed.events[]` and
-`body.sse[].response`. JSON bodies require `object: "response"`. Unknown keys and
+`body.sse[].response`. Deeper JSON body labels require `object: "response"`. Within known envelopes, unknown keys and
 types, dynamic schemas, duplicate keys, unsupported framing and cross-data-line
 SSE members remain unknown. Function arguments remain opaque strings. Unicode,
 escaped quotes, backslashes, controls and surrogate pairs are mapped structurally,
@@ -175,6 +240,13 @@ but different field sets cannot label primary locations, even with uniform
 secondary evidence. The full `"encrypted_content": ""` assignment has a direct
 proof-API regression; the real pinned scanner reports that empty assignment clean.
 None may weaken or redetermine the primary decision.
+
+Version-5 regressions additionally cover non-200 JSON errors, markup and plain
+text; strict status/decision allowlists; JSON scalars; unchanged SSE/deeper labels;
+nonoverlap, empty value proof, malformed/duplicate JSON and SSE, body/node/depth/input
+budgets, arbitrary model keys/values, persisted whole-value redaction, secondary
+failure with retained shape, clean/failed primary short-circuiting, and exact scan
+byte/primary-authority identity. All new response examples are synthetic.
 
 This candidate cannot classify discarded historical captures. Four historical
 generic-api-key detections remain field-identity unknown. No provider attempt is

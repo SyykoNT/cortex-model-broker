@@ -26,7 +26,7 @@ class ScannerDiagnosticsTests(unittest.TestCase):
         self.assertEqual(['gitleaks'], row['redactions'])
         self.assertEqual('gitleaks-match', row['data']['redacted_body'])
         diagnostics = row['data']['scanner_diagnostics']
-        self.assertEqual({'version', 'finding_count', 'rules', 'encoded_byte_count'}, set(diagnostics))
+        self.assertEqual({'version', 'finding_count', 'rules', 'encoded_byte_count', 'response_shape'}, set(diagnostics))
         self.assertEqual(1, diagnostics['finding_count'])
         self.assertEqual('github-pat', diagnostics['rules'][0]['rule_id'])
         self.assertEqual(1, diagnostics['rules'][0]['count'])
