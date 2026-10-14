@@ -31,7 +31,7 @@ class ResponseShapeTests(unittest.TestCase):
             self.assertIs(raw, call.args[1])
         self.assertTrue(all(loc['field_class'] == 'unknown' for loc in rows(result)))
         self.assertNotIn(TOKEN, json.dumps(result))
-        self.assertEqual(5, result['version'])
+        self.assertEqual(6, result['version'])
         return result
 
     def test_non200_json_error_markup_and_plain(self):
