@@ -31,8 +31,12 @@ class ScannerDiagnosticsTests(unittest.TestCase):
         self.assertEqual('github-pat', diagnostics['rules'][0]['rule_id'])
         self.assertEqual(1, diagnostics['rules'][0]['count'])
         for location in diagnostics['rules'][0]['locations']:
-            self.assertEqual({'start_line', 'end_line', 'start_column', 'end_column'}, set(location))
-            self.assertTrue(all(type(v) is int and v > 0 for v in location.values()))
+            self.assertEqual({'start_line', 'end_line', 'start_column', 'end_column',
+                              'field_path', 'field_class'}, set(location))
+            self.assertTrue(all(type(location[k]) is int and location[k] > 0
+                                for k in ('start_line', 'end_line', 'start_column', 'end_column')))
+            self.assertEqual('unknown', location['field_path'])
+            self.assertEqual('unknown', location['field_class'])
         text = (self.root / 'synthetic-detection.jsonl').read_text()
         self.assertNotIn(canary, text)
         for forbidden in ('Secret', 'Match', 'Entropy', 'File', 'Fingerprint', 'Description'):
