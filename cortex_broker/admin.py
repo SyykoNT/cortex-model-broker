@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 
-from .protocol import Refusal, reconstruct_sse
+from .protocol import Refusal, classify_response, reconstruct_sse
 
 MAX_REQUEST = 16_384
 MAX_RESPONSE = 65_536
@@ -289,7 +289,9 @@ class Controller:
                            'input': [{'role': 'user', 'content': PROMPT}], 'store': False, 'stream': True}
                 delivered = []
                 result = self.transport.responses(key, payload, lambda status, mime, body: delivered.append((status, mime)))
-                if len(delivered) != 1 or delivered[0][0] != 200 or 'text/event-stream' not in delivered[0][1]:
+                # Transport and retained replay validate SSE; MIME is a hint,
+                # not an independent acceptance gate or a rewritten observation.
+                if len(delivered) != 1 or delivered[0][0] != 200:
                     raise Refusal('inference_not_completed')
                 return {'run_id': run, 'reasoning': request['reasoning'], **summary(result, request['model'], request['reasoning']),
                         'reconstruction': self.reconstruct(run)}
@@ -336,7 +338,17 @@ class Controller:
                             or upstream['model'] != model or upstream['reasoning']['effort'] != effort
                             or upstream['store'] is not False or upstream['stream'] is not True):
                         raise ValueError()
-                    parsed = reconstruct_sse(data['body'])
+                    if data['bytes'] != len(data['body'].encode('utf-8')):
+                        raise ValueError()
+                    if 'classification' in data:
+                        parsed, classification = classify_response(
+                            data['status'], data['classification']['content_type'], data['body'])
+                        if classification != data['classification']:
+                            raise ValueError()
+                    else:
+                        # Legacy capture has no header observation. Never invent
+                        # one or reinterpret its recorded failed classification.
+                        parsed = reconstruct_sse(data['body'])
                     if parsed != data['reconstructed']:
                         raise ValueError()
                     completed.append({'reasoning': effort, **summary(parsed, model, effort)})
