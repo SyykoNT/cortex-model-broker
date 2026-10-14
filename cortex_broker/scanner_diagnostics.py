@@ -1,7 +1,7 @@
 """Secret-safe gitleaks metadata. Reports exist only in bounded pipes/memory.
 
 Never return/print/persist report bytes, Secret, Match, context or value fields.
-Only scanner rule IDs, counts and numeric scanner-input locations may escape.
+Only scanner rule IDs, counts, numeric locations and static schema labels escape.
 """
 import json
 import os
@@ -11,6 +11,7 @@ import subprocess
 import time
 
 from .protocol import Refusal
+from .scanner_attribution import attribute
 
 MAX_REPORT = 4_000_000
 MAX_FINDINGS = 4096
@@ -80,7 +81,7 @@ def run_scanner(scanner, encoded, root):
         process.stdout.close()
 
 
-def project(status, raw):
+def project(status, raw, encoded=None):
     """Drop all unapproved fields before returning; malformed reports fail closed."""
     def pairs(items):
         result = {}
@@ -106,6 +107,7 @@ def project(status, raw):
         if not report:
             unavailable()
         rules = {}
+        unsupported = []
         for finding in report:
             if type(finding) is not dict:
                 unavailable()
@@ -123,13 +125,24 @@ def project(status, raw):
                      location['end_column'] < location['start_column'])):
                 unavailable()
             rules.setdefault(rule, []).append(location)
-        return {'version': 1, 'finding_count': len(report), 'rules': [
+            # Decoded findings and future/unknown report tags are not proven
+            # direct scanner-input spans. Never copy tag strings into metadata.
+            if finding.get('Tags') != []:
+                unsupported.append(location)
+        summary = {'version': 2, 'finding_count': len(report), 'rules': [
             {'rule_id': rule, 'count': len(locations), 'locations': locations}
             for rule, locations in sorted(rules.items())]}
+        # Attribution sees only projected numeric locations and the in-memory
+        # scanner input. It never receives Secret/Match or the raw report.
+        del report
+        attribute(summary, encoded)
+        for location in unsupported:
+            location.update(field_path='unknown', field_class='unknown')
+        return summary
     except Exception:
         unavailable()
 
 
 def scan(scanner, encoded, root):
     status, report = run_scanner(scanner, encoded, root)
-    return project(status, report)
+    return project(status, report, encoded)
