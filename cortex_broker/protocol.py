@@ -57,7 +57,8 @@ def adapt(request):
     if flat:
         if any(t.get("name") == "functions" for t in grouped):
             raise Refusal("namespace_collision")
-        grouped.append({"type": "namespace", "name": "functions", "tools": flat})
+        grouped.append({"type": "namespace", "name": "functions",
+                        "description": "Tools provided by the caller.", "tools": flat})
         changes.append("tools:group_functions_namespace")
     if "tools" in out:
         out["tools"] = grouped

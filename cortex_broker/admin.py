@@ -273,7 +273,19 @@ class Controller:
                       and m.get('visibility') == 'list']
             return {'run_id': run, 'models': models}
         if command == 'refresh':
-            self.auth.access(force_refresh=True)
+            from .auth import AuthError
+            try:
+                self.auth.access(force_refresh=True)
+            except AuthError as error:
+                # Closed diagnostic vocabulary only: never persist provider text,
+                # token response fields or arbitrary exception strings.
+                known = {'sign_in_required', 'plan_scope_not_granted',
+                         'refresh_not_yet_allowed', 'unknown_refresh_time_format',
+                         'provider_request_failed', 'incomplete_token_response',
+                         'invalid_token_type', 'invalid_expiry'}
+                reason = str(error) if str(error) in known else 'auth_failure'
+                self.captured(run, 'admin.refresh.refused', {'reason': reason})
+                raise Refusal('operation_failed') from None
             result = self.auth.status()
             self.captured(run, 'admin.refresh.completed', result)
             return {'run_id': run, 'session': result}
