@@ -183,7 +183,8 @@ class ProtocolTests(unittest.TestCase):
             RunKeys().mint('fixture', 'qa', 'other-model', 'high', time.time()+60, 10)
 
     def test_sse_completion_and_tool_capture(self):
-        events = [{'type': 'response.output_item.done', 'item': {'type': 'function_call', 'arguments': '{"cmd":"true"}'}},
+        events = [{'type': 'response.output_item.done', 'output_index': 0, 'item': {'id': 'fc_fixture', 'type': 'function_call', 'arguments': '{"cmd":"true"}'}},
+
                   {'type': 'response.completed', 'response': {'output': [], 'usage': {'input_tokens': 1}}}]
         body = ''.join('data: '+json.dumps(e)+'\n\n' for e in events)
         got = reconstruct_sse(body)
