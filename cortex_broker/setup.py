@@ -30,7 +30,8 @@ class Server(ThreadingHTTPServer):
 
 def make_server(directory, port, *, admin_path=None, admin_uid=None, admin_gid=None,
                 transport_factory=None, codex_binary=None, capture_directory=None,
-                scanner=None, worker_port=None, worker_host='127.0.0.1'):
+                scanner=None, worker_port=None, worker_host='127.0.0.1',
+                pilot_worker_socket=None, pilot_capture_socket=None):
     from pathlib import Path
     import ipaddress
     admin_options = (admin_path, admin_uid, admin_gid)
@@ -44,6 +45,10 @@ def make_server(directory, port, *, admin_path=None, admin_uid=None, admin_gid=N
         state, capture = Path(directory).absolute(), Path(capture_directory).absolute()
         if state == capture or state in capture.parents or capture in state.parents:
             raise ValueError('state_capture_must_be_separate')
+    if (pilot_worker_socket is None) != (pilot_capture_socket is None):
+        raise ValueError('incomplete_pilot_configuration')
+    if pilot_worker_socket is not None and (capture_directory is None or worker_port is not None):
+        raise ValueError('invalid_pilot_configuration')
     if worker_port is not None:
         if capture_directory is None:
             raise ValueError('worker_listener_requires_capture')
@@ -74,6 +79,12 @@ def make_server(directory, port, *, admin_path=None, admin_uid=None, admin_gid=N
                 transport = Transport(server.auth, keys, capture, capture.on_limit)
             codex = CodexLimits(codex_binary, server.auth.store.root) if codex_binary else None
             controller = Controller(server.auth, keys, transport=transport, codex=codex)
+            if pilot_worker_socket is not None:
+                from .pilot import PilotReadiness, PilotTransport, UnixWorkerServer
+                readiness = PilotReadiness(transport.capture, pilot_capture_socket, admin_uid)
+                server.worker = UnixWorkerServer(pilot_worker_socket, admin_gid, readiness,
+                                                PilotTransport(transport, readiness)).start()
+                controller.worker_ready = readiness.worker_ready
             server.admin = AdminServer(admin_path, admin_uid, admin_gid, controller).start()
             if worker_port is not None:
                 from .worker import Readiness, WorkerServer
@@ -183,6 +194,8 @@ def main():
     parser.add_argument("--gitleaks", help="Trusted absolute gitleaks executable (required with capture)")
     parser.add_argument("--worker-port", type=int, help="Separate worker listener; admission remains disabled")
     parser.add_argument("--worker-host", default='127.0.0.1', help="Explicit numeric IPv4 bind address, never wildcard")
+    parser.add_argument("--pilot-worker-socket", help="Supervised network-none worker UDS")
+    parser.add_argument("--pilot-capture-socket", help="Live orchestrator capture transaction socket")
     args = parser.parse_args()
     admin_options = (args.admin_socket, args.admin_uid, args.admin_gid)
     if any(v is not None for v in admin_options) and not all(v is not None for v in admin_options):
@@ -194,7 +207,8 @@ def main():
         server = make_server(args.state, args.port, admin_path=args.admin_socket,
                              admin_uid=args.admin_uid, admin_gid=args.admin_gid, codex_binary=args.codex_binary,
                              capture_directory=args.capture_directory, scanner=args.gitleaks,
-                             worker_port=args.worker_port, worker_host=args.worker_host)
+                             worker_port=args.worker_port, worker_host=args.worker_host,
+                             pilot_worker_socket=args.pilot_worker_socket, pilot_capture_socket=args.pilot_capture_socket)
     except Exception:
         raise SystemExit("setup_start_failed") from None
     import signal
