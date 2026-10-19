@@ -60,6 +60,21 @@ remain deployment work. No fake heartbeat or ready marker substitutes for those
 requirements. The service does not start any agent, container, scheduler, Claude
 lane or Grok lane. No token-metering dashboard is included.
 
+Transport supplies a fresh canonical UUID `prompt_cache_key` on every upstream
+request, replacing any caller value. `request.received` retains the original
+caller request. `request.upstream` uses a lossless split representation: its
+`request` is the adapted request without that field, and `broker_cache_uuid`
+holds the generated value. Reconstruct the exact upstream object by inserting
+`prompt_cache_key=broker_cache_uuid`; neither request record has a scanner
+exemption. Both are scanned before dispatch.
+
+Only transport-validated successful SSE response metadata may admit a canonical
+cache UUID under the generic high-entropy rule, including a different canonical
+UUID returned by the provider. Credential-format detectors inspect the original
+bytes. Complete-Match all-occurrence proof and a full re-scan masking only those
+UUID value spans are both required; request, output, tool, malformed, ambiguous,
+and mixed occurrences retain refusal. Diagnostic coverage is not authority.
+
 Transport buffering preserves the original upstream SSE bytes but delays
 consumer delivery until capture completes. A gitleaks hit redacts that whole
 captured body rather than publishing a partial secret. Partial streams remain

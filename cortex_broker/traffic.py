@@ -15,6 +15,7 @@ import uuid
 from .auth import HTTP, bounded_body
 from .protocol import Refusal, adapt, classify_response
 from .scanner_diagnostics import scan
+from .cache_metadata import scan_response
 
 
 class Capture:
@@ -35,7 +36,7 @@ class Capture:
         with self.lock:
             self.secrets.update(v for v in values if isinstance(v, str) and v)
 
-    def safe(self, value):
+    def safe(self, value, *, response_cache_uuid=None):
         # Header dictionaries are never passed by the transport. Explicit credential
         # fields are removed even if a detector would miss their particular format.
         redactions = []
@@ -64,21 +65,24 @@ class Capture:
             return obj
         cleaned = clean(value)
         encoded = json.dumps(cleaned, ensure_ascii=True).encode()
-        diagnostics = scan(self.scanner, encoded, self.root)
+        diagnostics = (scan_response(self.scanner, encoded, self.root, response_cache_uuid)
+                       if response_cache_uuid is not None and not redactions
+                       else scan(self.scanner, encoded, self.root))
         if diagnostics is not None:
             # Never put a detected secret in an artifact, including a scanner report.
             cleaned = {'redacted_body': 'gitleaks-match', 'scanner_diagnostics': diagnostics}
             redactions.append('gitleaks')
         return cleaned, redactions
 
-    def append(self, run_id, kind, value):
+    def append(self, run_id, kind, value, *, response_cache_uuid=None):
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,160}', run_id):
             raise Refusal('invalid_run_id')
         # Readiness is scoped by composition: broker-only fixed admin acceptance
         # is not worker admission. Worker traffic requires all three sources.
         if self.capture_health() is not True:
             raise Refusal('capture_unavailable')
-        cleaned, redactions = self.safe(value)
+        cleaned, redactions = self.safe(value, response_cache_uuid=(
+            response_cache_uuid if kind == 'response' else None))
         row = {'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                'run_id': run_id, 'kind': kind, 'data': cleaned,
                'flags': ['secret'] if redactions else [], 'redactions': redactions}
@@ -143,9 +147,20 @@ class Transport:
             raise
         run = admission['run_id']
         call_id = str(uuid.uuid4())
-        self.capture.append(run, 'request.received', {'call_id': call_id, 'request': request, 'admission': admission})
+        received = self.capture.append(run, 'request.received', {'call_id': call_id, 'request': request, 'admission': admission})
+        if received['flags']:
+            raise Refusal('request_secret_detected')
         payload, changes = adapt(request)
-        self.capture.append(run, 'request.upstream', {'call_id': call_id, 'request': payload, 'adaptations': changes})
+        payload.pop('prompt_cache_key', None)
+        cache_uuid = str(uuid.uuid4())
+        # Lossless split representation: caller content is scanned unchanged;
+        # broker-generated cache metadata is recorded separately, then inserted
+        # into the actual upstream payload. No request-side scanner exemption.
+        captured = self.capture.append(run, 'request.upstream', {'call_id': call_id,
+            'request': payload, 'adaptations': changes, 'broker_cache_uuid': cache_uuid})
+        if captured['flags']:
+            raise Refusal('request_secret_detected')
+        payload['prompt_cache_key'] = cache_uuid
         upstream = urllib.request.Request('https://api.openai.com/v1/responses', data=json.dumps(payload).encode(),
             headers={'Authorization': 'Bearer ' + self.access(), 'Content-Type': 'application/json', 'Accept': 'text/event-stream'})
         deadline = time.monotonic() + 120
@@ -174,9 +189,11 @@ class Transport:
             body = b''.join(chunks)
             text = body.decode('utf-8')
             reconstructed, classification = classify_response(status, content_type, text)
-            self.capture.append(run, 'response', {'call_id': call_id, 'status': status,
+            captured = self.capture.append(run, 'response', {'call_id': call_id, 'status': status,
                 'body': text, 'reconstructed': reconstructed, 'bytes': size,
-                'classification': classification})
+                'classification': classification}, response_cache_uuid=cache_uuid)
+            if captured['flags']:
+                raise Refusal('response_secret_detected')
             if status == 429 or any(s in text for s in ['subscription_sharing_usage_limit_exceeded', 'subscription_sharing_usage_unavailable']):
                 self.on_limit(run, {'call_id': call_id, 'status': status})
             # Buffer through the terminal event so redaction sees secrets split over
