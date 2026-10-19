@@ -284,7 +284,12 @@ class Controller:
                          'provider_request_failed', 'incomplete_token_response',
                          'invalid_token_type', 'invalid_expiry'}
                 reason = str(error) if str(error) in known else 'auth_failure'
-                self.captured(run, 'admin.refresh.refused', {'reason': reason})
+                diagnostic = {'reason': reason}
+                retry_at = getattr(error, 'retry_at', None)
+                if (reason == 'refresh_not_yet_allowed' and type(retry_at) in (int, float)
+                        and math.isfinite(retry_at) and retry_at >= 0):
+                    diagnostic['retry_at'] = retry_at
+                self.captured(run, 'admin.refresh.refused', diagnostic)
                 raise Refusal('operation_failed') from None
             result = self.auth.status()
             self.captured(run, 'admin.refresh.completed', result)

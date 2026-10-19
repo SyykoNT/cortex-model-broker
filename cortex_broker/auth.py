@@ -25,6 +25,9 @@ DIRECT = "chatgpt.tokens.use.direct"
 
 class AuthError(Exception):
     """Safe code only: never include provider bodies or token values."""
+    def __init__(self, code, *, retry_at=None):
+        super().__init__(code)
+        self.retry_at = retry_at
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -268,7 +271,7 @@ class Auth:
                 if earliest is not None:
                     try:
                         if time.time() < float(earliest):
-                            raise AuthError("refresh_not_yet_allowed")
+                            raise AuthError("refresh_not_yet_allowed", retry_at=float(earliest))
                     except (TypeError, ValueError):
                         raise AuthError("unknown_refresh_time_format") from None
                 response = self.get_json(TOKEN, {"grant_type": "refresh_token", "client_id": record["client_id"],

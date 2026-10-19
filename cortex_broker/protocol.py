@@ -202,10 +202,63 @@ def reconstruct_sse(body):
         valid = False
     completed = [e for e in events if e.get('type') == 'response.completed']
     failures = [e for e in events if e.get('type') in {'response.failed', 'response.incomplete', 'error'}]
-    return {'events': events, 'response': completed[-1].get('response') if completed else None,
+    response = copy.deepcopy(completed[-1].get('response')) if completed else None
+    if response is not None:
+        try:
+            response = reassemble_output(events, response)
+        except (ValueError, TypeError):
+            valid = False
+    return {'events': events, 'response': response,
             'complete': valid and len(completed) == 1 and not failures and events[-1] is completed[0],
             'terminal': ('invalid-sse' if not valid else failures[-1]['type'] if failures
                          else 'response.completed' if completed else 'interrupted')}
+
+
+def reassemble_output(events, response):
+    """Some upstreams omit terminal output; reconstruct only from complete items.
+
+    Preserve wire events exactly. No delta guesses or fabricated tool arguments.
+    A populated terminal output must agree with every observed completed item.
+    """
+    added, finished = {}, {}
+    for event in events:
+        kind = event['type']
+        if kind not in {'response.output_item.added', 'response.output_item.done'}:
+            continue
+        index, item = event.get('output_index'), event.get('item')
+        if (type(index) is not int or index < 0 or index > 10000 or type(item) is not dict
+                or not isinstance(item.get('id'), str) or not item['id']
+                or not isinstance(item.get('type'), str)):
+            raise ValueError('invalid output item')
+        if kind.endswith('.added'):
+            if index in added or index in finished:
+                raise ValueError('duplicate or late added item')
+            added[index] = item
+        else:
+            if index in finished:
+                raise ValueError('duplicate completed item')
+            if index in added and any(added[index].get(k) != item.get(k) for k in ('id', 'type')):
+                raise ValueError('item identity changed')
+            finished[index] = item
+    if not added and not finished:
+        return response
+    terminal = response.get('output')
+    if type(terminal) is not list:
+        raise ValueError('invalid terminal output')
+    if set(added) - set(finished):
+        raise ValueError('incomplete output items')
+    if terminal:
+        for index, item in finished.items():
+            if index >= len(terminal) or json.dumps(terminal[index], sort_keys=True, allow_nan=False) != json.dumps(item, sort_keys=True, allow_nan=False):
+                raise ValueError('conflicting terminal output')
+    else:
+        if sorted(finished) != list(range(len(finished))):
+            raise ValueError('incomplete output items')
+        items = [finished[i] for i in range(len(finished))]
+        if len({i['id'] for i in items}) != len(items):
+            raise ValueError('duplicate item identity')
+        response['output'] = copy.deepcopy(items)
+    return response
 
 
 def classify_response(status, content_type, body):
