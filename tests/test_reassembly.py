@@ -22,6 +22,22 @@ class ReassemblyTests(unittest.TestCase):
         self.assertTrue(p['complete']);self.assertEqual([events[1]['item']],p['response']['output'])
         self.assertEqual([],p['events'][-1]['response']['output'])
         self.assertEqual(events,p['events'])
+    def test_strict_keepalive_retained_before_completion(self):
+        events=self.fixture();events.insert(0,{'type':'keepalive','sequence_number':2})
+        raw=''.join('event: '+e['type']+'\ndata: '+json.dumps(e)+'\n\n' for e in events)
+        parsed=reconstruct_sse(raw)
+        self.assertTrue(parsed['complete']);self.assertEqual(events,parsed['events'])
+    def test_keepalive_cannot_carry_content_or_replace_completion(self):
+        for bad in ({'type':'keepalive'}, {'type':'keepalive','sequence_number':True},
+                    {'type':'keepalive','sequence_number':-1},
+                    {'type':'keepalive','sequence_number':2,'response':{}},
+                    {'type':'keepalive','sequence_number':2,'text':'fixture'},
+                    {'type':'keepalive','sequence_number':'2'}):
+            with self.subTest(bad=bad):self.assertFalse(self.parse([bad]+self.fixture())['complete'])
+        keep={'type':'keepalive','sequence_number':2}
+        self.assertFalse(self.parse([keep])['complete'])
+        self.assertFalse(self.parse(self.fixture()+[keep])['complete'])
+        self.assertFalse(reconstruct_sse('event: response.created\ndata: '+json.dumps(keep)+'\n\n')['complete'])
     def test_populated_terminal_matches_exactly(self):
         events=self.fixture();events[-1]['response']['output']=[copy.deepcopy(events[1]['item'])]
         self.assertTrue(self.parse(events)['complete'])
