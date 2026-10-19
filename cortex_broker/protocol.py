@@ -180,8 +180,11 @@ def reconstruct_sse(body):
                 done = True
                 continue
             event = json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+            keepalive = (isinstance(event, dict) and event.get('type') == 'keepalive'
+                         and set(event) == {'type', 'sequence_number'}
+                         and type(event['sequence_number']) is int and event['sequence_number'] >= 0)
             if (not isinstance(event, dict) or not isinstance(event.get('type'), str)
-                    or not (event['type'].startswith('response.') or event['type'] == 'error')
+                    or not (event['type'].startswith('response.') or event['type'] == 'error' or keepalive)
                     or (name is not None and name != event['type'])):
                 raise ValueError('invalid or conflicting event type')
             response = event.get('response')
