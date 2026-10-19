@@ -281,9 +281,9 @@ class FC5Tests(unittest.TestCase):
         self.provider.responses = [response(0), response(1)]
         self.provider.sent.clear()
         original = self.capture.append
-        def drop(run, kind, value):
+        def drop(run, kind, value, **kwargs):
             if kind != 'response':
-                return original(run, kind, value)
+                return original(run, kind, value, **kwargs)
         with patch.object(self.capture, 'append', side_effect=drop):
             self.assertFalse(self.call()['ok'])
         self.assertEqual(1, len(self.provider.sent))
@@ -295,13 +295,13 @@ class FC5Tests(unittest.TestCase):
                 ('request.received', 2, 1), ('request.upstream', 2, 1), ('response', 2, 2),
                 ('admin.tool_probe.completed', 1, 2)]:
             seen = 0
-            def fail(run, k, value):
+            def fail(run, k, value, **kwargs):
                 nonlocal seen
                 if k == kind:
                     seen += 1
                     if seen == occurrence:
                         raise OSError('synthetic capture failure')
-                return original(run, k, value)
+                return original(run, k, value, **kwargs)
             with self.subTest(kind=kind, occurrence=occurrence):
                 self.provider.sent.clear()
                 with patch.object(self.capture, 'append', side_effect=fail):
@@ -316,6 +316,14 @@ class FC5Tests(unittest.TestCase):
         node = self.capture.root / (run + '.jsonl')
         original = self.rows(run)
         mutations = []
+        for alteration in ('missing', 'noncanonical', 'wrong-type'):
+            rows = copy.deepcopy(original)
+            upstream = next(r['data'] for r in rows if r['kind'] == 'request.upstream')
+            if alteration == 'missing':
+                upstream.pop('broker_cache_uuid')
+            else:
+                upstream['broker_cache_uuid'] = 'not-a-uuid' if alteration == 'noncanonical' else 42
+            mutations.append(rows)
         for kind in ['admin.tool_probe', 'tool.result', 'admin.tool_probe.completed', 'response']:
             mutations.append([r for r in copy.deepcopy(original) if r['kind'] != kind])
         for kind, field, value in [('tool.result', 'output', 'forged'), ('tool.result', 'call_id', 'call_other'),

@@ -6,6 +6,7 @@ one contract, anchored to these constants rather than mutually editable logs.
 import copy
 import json
 import re
+import uuid
 
 from .protocol import Refusal, adapt, classify_response
 
@@ -184,7 +185,7 @@ def replay(rows, run, strict_json, summarize, *, partial=False):
         seen.add(call)
         require(upstream['call_id'] == response['call_id'] == call)
         require(set(received) == {'call_id', 'request', 'admission'}
-                and set(upstream) == {'call_id', 'request', 'adaptations'}
+                and set(upstream) == {'call_id', 'request', 'adaptations', 'broker_cache_uuid'}
                 and set(response) == {'call_id', 'status', 'body', 'reconstructed', 'bytes', 'classification'})
         admission = received['admission']
         if index == 0:
@@ -195,6 +196,10 @@ def replay(rows, run, strict_json, summarize, *, partial=False):
         expected = first if index == 0 else next_request(first, parsed_calls[0], tool)
         require(same(received['request'], expected))
         adapted, changes = adapt(expected)
+        cache_uuid = upstream['broker_cache_uuid']
+        require(type(cache_uuid) is str and len(cache_uuid) == 36
+                and str(uuid.UUID(cache_uuid)) == cache_uuid)
+        adapted.pop('prompt_cache_key', None)
         require(same(upstream['request'], adapted) and same(upstream['adaptations'], changes))
         require(type(response['status']) is int and response['status'] == 200
                 and type(response['bytes']) is int and response['bytes'] == len(response['body'].encode('utf-8')))

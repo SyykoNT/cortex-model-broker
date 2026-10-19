@@ -51,7 +51,9 @@ class ScannerDiagnosticsTests(unittest.TestCase):
         canary = 'gh' + 'p_' + secrets.token_hex(18)
         f.provider.responses[0]['output'][0]['summary'] = [{'type': 'summary_text', 'text': canary}]
         reply = f.call()
-        self.assertEqual('reconstruction_unavailable', reply['error'])
+        # Flagged response is now refused before any bytes are delivered; the
+        # admin boundary returns its existing closed operation-failure code.
+        self.assertEqual('operation_failed', reply['error'])
         self.assertEqual(1, len(f.provider.sent))
         files = list(f.capture.root.iterdir())
         self.assertEqual(1, len(files))
